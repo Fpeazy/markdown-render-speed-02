@@ -1023,7 +1023,31 @@ function parseBlocks(src) {
         const need = b.indent;
         if (need <= 0) { k++; continue; }
         if (wsCols(cur) >= need) { adv(cur, need); contTotal += need; contLast = need; k++; }
-        else break;
+        else {
+          // A col-0 plain-text line stays inside the item when the
+          // item's last child is an EMPTY block (probe39/doc-19: '+ a'
+          // + '  >' + 'tab' keeps 'tab' in the item; '+ 4.' + 'tab'
+          // too). An empty block does not close the item — the line
+          // becomes a paragraph in it (Phase D). A block with content
+          // DOES close the item ('+  > x' + 'tab' is outside; '+ 4. x'
+          // + 'tab' is outside). Empty means: a quote with no children,
+          // a quote holding only an empty fence, or a list with no
+          // items / all items empty.
+          const ch = b.children || [];
+          const last = ch.length > 0 ? ch[ch.length - 1] : null;
+          let lastEmpty = false;
+          if (last) {
+            if (last.t === T_QUOTE) {
+              if (!last.children || last.children.length === 0) lastEmpty = true;
+              else if (last.children.length === 1 && last.children[0].t === T_CODE && (!last.children[0].lines || last.children[0].lines.length === 0)) lastEmpty = true;
+            } else if (last.t === T_LIST) {
+              if (!last.children || last.children.length === 0) lastEmpty = true;
+              else lastEmpty = last.children.every(it => !it.children || it.children.length === 0);
+            }
+          }
+          if (!isBlankAt(cur) && !startsInterrupt(cur) && lastEmpty) { k++; continue; }
+          break;
+        }
       } else {
         k++; // list: no marker of its own
       }
@@ -1221,7 +1245,13 @@ function parseBlocks(src) {
         // end tag; types 2-5 at their own end markers)
         leaf.lines.push('');
       } else {
-        finalizeLeaf();
+        // When the last paragraph line was indented (lastParaIndented),
+        // a blank line does NOT close the paragraph: the next indented
+        // line continues it, separated by a blank line in the output
+        // (probe38/doc-19: '+ y_2_.' + '      support?' + blank +
+        // '    \tindented' is one paragraph, not a code block). Keep
+        // the leaf open so Phase D step 9 can continue it.
+        if (!(lastParaIndented && leaf && leaf.t === T_PARA)) finalizeLeaf();
         pendingBlank = true;
         // the blank's parent level. A truly empty/whitespace-only line
         // is a blank at the outermost level (depth 1) — it separates
@@ -1370,10 +1400,12 @@ function parseBlocks(src) {
           const b = blk(T_CODE);
           b.lines = [];
           adv(cur, 4);
-          // Inside a container, expand tabs in the code content by the
-          // effective column (doc-08: '  > \t\tX' gives '  X', not a
-          // literal tab); at top level the raw content is kept.
-          b.lines.push(stack.length > 1 ? expandTabs(rest(cur), cur.c - (contTotal - contLast)) : rest(cur));
+          // Inside a container, expand only LEADING tabs in the code
+          // content by the effective column (doc-08: '  > \t\tX' gives
+          // '  X'); a tab after other content stays literal (doc-19:
+          // '> \tindented' keeps the tab). At top level the raw content
+          // is kept.
+          b.lines.push(stack.length > 1 ? expandLeadTabs(rest(cur), cur.c - (contTotal - contLast)) : rest(cur));
           addChild(top(), b);
           leaf = b;
           lineDone = true;
@@ -1390,6 +1422,11 @@ function parseBlocks(src) {
             const text = expandLeadTabs(rest(cur), cur.c);
             let n = 0;
             while (n < 4 && n < text.length && text.charCodeAt(n) === 32) n++;
+            // After an indented paragraph line AND a blank line, the
+            // continuation is separated by a blank line in the output
+            // (probe38/doc-19: '      support?' + blank +
+            // '    \tindented' gives 'support?\n\n  indented').
+            if (lastParaIndented && pendingBlank) { leaf.lines.push(''); pendingBlank = false; }
             leaf.lines.push(text.slice(n));
             // An indented paragraph line inside a list item blocks the
             // next line's lazy continuation (doc-08/probe26).
@@ -1722,7 +1759,11 @@ function tryListItem(cur, baseCol, leaf, stack, parent, addChild, finalizeLeaf, 
     else break;
   }
   const empty = j >= s.length;
-  if (paraOpen && empty) return null;
+  // An empty item cannot interrupt a paragraph — except when the open
+  // paragraph sits inside a list item, where a nested (possibly empty)
+  // list may start (probe40/doc-19: '+ a' + '  4.' starts a nested
+  // empty ordered list; the same exception as the number rule above).
+  if (paraOpen && empty && parent.t !== T_ITEM) return null;
   // A table body row wins over an EMPTY list marker (doc-07: a lone '*'
   // after a table is a single-cell row, not a list item). A non-empty
   // list item ends the table instead (see the finalize below).
@@ -3268,8 +3309,20 @@ function renderBlocks(parsed) {
 
 function renderChildren(children, refs, listCtx) {
   let out = '';
+  // In a tight list, a paragraph AFTER a sublist is wrapped in <p>
+  // even though the list is tight (probe40/doc-19: '+ a' + '  4.' +
+  // 'tab' gives '<p>tab</p>'; a paragraph after a blockquote stays
+  // unwrapped). Track whether a sublist has been seen among the
+  // preceding siblings in this children array.
+  let seenList = false;
   for (let i = 0; i < children.length; i++) {
-    out += renderBlock(children[i], refs, listCtx, i, children.length);
+    const child = children[i];
+    if (child.t === T_LIST) seenList = true;
+    if (child.t === T_PARA && listCtx && listCtx.tight && seenList) {
+      out += '<p>' + renderInline(child.lines.join('\n'), refs) + '</p>\n';
+    } else {
+      out += renderBlock(child, refs, listCtx, i, children.length);
+    }
   }
   return out;
 }
@@ -3333,7 +3386,20 @@ function renderBlock(b, refs, listCtx, index, count) {
           let out = '<li>';
           if (listCtx && listCtx.tight) out += inner;
           else out += '<p>' + inner + '</p>\n';
-          for (let i = 1; i < ch.length; i++) out += renderBlock(ch[i], refs, listCtx, i, ch.length);
+          // In a tight list, a paragraph AFTER a sublist is wrapped in
+          // <p> even though the list is tight (probe40/doc-19: '+ a' +
+          // '  4.' + 'tab' gives '<p>tab</p>'; a paragraph after a
+          // blockquote stays unwrapped). Track whether a sublist has
+          // been seen among the preceding siblings.
+          let seenList = ch[0].t === T_LIST;
+          for (let i = 1; i < ch.length; i++) {
+            if (ch[i].t === T_LIST) seenList = true;
+            if (ch[i].t === T_PARA && listCtx && listCtx.tight && seenList) {
+              out += '<p>' + renderInline(ch[i].lines.join('\n'), refs) + '</p>\n';
+            } else {
+              out += renderBlock(ch[i], refs, listCtx, i, ch.length);
+            }
+          }
           return out + '</li>\n';
         }
       }
