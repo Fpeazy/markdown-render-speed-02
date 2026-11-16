@@ -366,10 +366,15 @@ function htmlBlockEnds(type, line) {
 }
 
 function atxHeading(line) {
-  const m = /^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)$/.exec(line);
+  const m = /^ {0,3}(#{1,6})(?:[ \t]+(.*)|[ \t]*)$/.exec(line);
   if (!m) return null;
   let content = m[2] === undefined ? '' : m[2];
-  content = content.replace(/[ \t]+$/, '').replace(/[ \t]+#+[ \t]*$/, '').replace(/[ \t]+$/, '');
+  content = content.replace(/[ \t]+$/, '');
+  // closing sequence: trailing #'s preceded by whitespace; a content of
+  // only #'s is a closing sequence too ('### ###' -> empty, cm-079)
+  if (/^#+$/.test(content)) content = '';
+  else content = content.replace(/[ \t]+#+$/, '');
+  content = content.replace(/[ \t]+$/, '');
   return { level: m[1].length, text: content };
 }
 function isHr(line) {
@@ -510,6 +515,9 @@ function parseBlocks(text, ctx) {
       while (i < lines.length) {
         const l = lines[i];
         if (isBlankLine(l)) {
+          // whitespace-only line with indent >= 4 is code content
+          // (keeps indent-4 spaces, cm-112), not a blank line
+          if (l !== '' && indentOf(l) >= 4) { buf.push(stripIndentCols(l, 4)); i++; continue; }
           // blank belongs only if followed by another indented line
           let j = i + 1;
           while (j < lines.length && isBlankLine(lines[j])) j++;
@@ -535,7 +543,8 @@ function parseBlocks(text, ctx) {
     if (fs) {
       const buf = [];
       i++;
-      while (i < lines.length && !fenceEnd(lines[i], fs)) { buf.push(lines[i]); i++; }
+      // stop before the phantom trailing '' line of a text ending in '\n'
+      while (i < lines.length && !fenceEnd(lines[i], fs) && !(i === lines.length - 1 && lines[i] === '' && ctx.endsWithNL)) { buf.push(lines[i]); i++; }
       if (i < lines.length) i++; // skip closing fence
       const content = buf.map(l => stripIndentChars(l, fs.indent)).join('\n');
       markBlock();
@@ -699,26 +708,37 @@ function gatherQuote(lines, i, ctx) {
   const inner = [];
   const lazy = new Set();
   let fenceOpen = null;
+  // provenance of the last inner line: 'marker' (from a '>' line) or
+  // 'lazy' (a lazy continuation), plus whether it was stripped by 4 cols.
+  // A lazy line with indent >= 4 is stripped by 4 only after a '>' line;
+  // a lazy setext '=' line after an unstripped lazy line gets 4 spaces
+  // (cm-093: '> foo\nbar\n===' -> 'foo\nbar\n    ===').
+  let prevKind = 'start';
+  let prevLazyStripped = false;
   let j = i;
   while (j < lines.length) {
     const line = lines[j];
     const stripped = stripQuoteMarker(line);
     if (stripped !== null) {
       inner.push(stripped);
+      prevKind = 'marker'; prevLazyStripped = false;
       if (fenceOpen) { if (fenceEnd(stripped, fenceOpen)) fenceOpen = null; }
       else { const fs = fenceStart(stripped); if (fs) fenceOpen = fs; }
       j++;
       continue;
     }
-    if (isBlankLine(line)) { inner.push(''); j++; continue; }
+    if (isBlankLine(line)) { inner.push(''); prevKind = 'blank'; prevLazyStripped = false; j++; continue; }
     if (fenceOpen) break; // line without > while a fence is open ends the quote
     const prev = inner.length ? inner[inner.length - 1] : null;
     if (prev !== null && prevIsParagraphLine(prev) && !interruptsParagraph(line)) {
       const idx = inner.length;
       let il = expandTabs(line, 0);
-      if (indentOf(il) >= 4) il = stripIndentCols(il, 4);
+      let stripped4 = false;
+      if (indentOf(il) >= 4 && prevKind === 'marker') { il = stripIndentCols(il, 4); stripped4 = true; }
+      if (/^ {0,3}=+[ \t]*$/.test(il) && prevKind === 'lazy' && !prevLazyStripped) il = '    ' + il.replace(/^ +/, '');
       inner.push(il);
       lazy.add(idx);
+      prevKind = 'lazy'; prevLazyStripped = stripped4;
       j++;
       continue;
     }
@@ -761,11 +781,15 @@ function gatherList(lines, i, ctx) {
       let k = j;
       while (k < lines.length && isBlankLine(lines[k])) k++;
       if (k < lines.length) {
+        // a thematic break ends the list (cm-060: '* * *' after items)
+        if (isHr(expandTabs(lines[k], 0))) break;
         const lm = listMarker(expandTabs(lines[k], 0));
         if (sameListMarker(lm, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; continue; }
       }
       break;
     }
+    // a thematic break ends the list (cm-060)
+    if (isHr(expandTabs(lines[j], 0))) break;
     const lm = listMarker(expandTabs(lines[j], 0));
     if (!sameListMarker(lm, ordered, delim) || indentOf(lines[j]) > 3) break;
     const ci = lm.contentIndent;
@@ -777,6 +801,8 @@ function gatherList(lines, i, ctx) {
         let k = j;
         while (k < lines.length && isBlankLine(lines[k])) k++;
         if (k >= lines.length) { j = k; break; }
+        // a thematic break ends the item (and the list)
+        if (isHr(expandTabs(lines[k], 0))) break;
         const lm2 = listMarker(expandTabs(lines[k], 0));
         if (sameListMarker(lm2, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; break; }
         if (indentOf(lines[k]) >= ci) {
@@ -898,15 +924,17 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
   const q2 = skipWsNoBlank(text, p);
   if (q2 >= 0 && text[q2] === '[') {
     const lab = scanLabel(text, q2);
-    if (lab) {
-      const key = normalizeLabel(lab.label);
+    if (!lab) return null;
+    const key = normalizeLabel(lab.label);
+    if (key !== '') {
       if (refs.has(key)) {
         const ref = refs.get(key);
         return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: lab.end };
       }
       return null; // label present but undefined -> no link (no shortcut fallback)
     }
-    return null;
+    // empty label '[]': collapsed reference, fall through to shortcut
+    // (link text is the label, e.g. [lexer callback][])
   }
   // shortcut reference: label = link text
   const rawLabel = text.slice(opener.pos + 1, linkTextEnd);
