@@ -1663,8 +1663,11 @@ function mkDelim(c, n, o, l, node, ix, im) {
   // delimiter chars were used (1 for em, 2 for strong) — used by the
   // marked emphasis quirk (inner emphasis blocking an outer one). bl:
   // true once this closer has blocked an outer emphasis (it blocks only
-  // the first closer after it).
-  return { c: c, n: n, o: o, l: l, a: true, nd: node, ix: ix, im: im, after: -1, sc: false, op: null, ul: 0, bl: false };
+  // the first closer after it). on: the ORIGINAL run length; n shrinks
+  // as the run is consumed, but the odd-match rule reads the original
+  // lengths ('**foo***bar**': the leftover '*' of the '***' closer
+  // pairs with a later '**' — (3+2)%3 != 0, so it is not blocked).
+  return { c: c, n: n, on: n, o: o, l: l, a: true, nd: node, ix: ix, im: im, after: -1, sc: false, op: null, ul: 0, bl: false };
 }
 
 // native-scanner fast path (technique 2): a single regex test replaces
@@ -2708,62 +2711,164 @@ function processEmphasis(delims) {
     const d = delims[di];
     if (!d.a || !d.l) continue;
     if (d.c !== 42 && d.c !== 95 && d.c !== 126) continue;
+    // marked quirk: a pure-closer '**' run (can close, cannot open)
+    // prefers a pure-opener single '*' over a nearer '**' opener.
+    // Measured grid ('*foo**bar**' + preceding/following char):
+    // the em forms ('<em>foo**bar*</em>') iff the single '*' opener
+    // is a pure opener (can open, cannot close — at the start or
+    // after a space/punctuation, NOT after a word char) AND the '**'
+    // closer is a pure closer (can close, cannot open — at the end
+    // or before a space/punctuation, NOT before a word char).
+    // Otherwise the strong forms ('*foo**bar**baz' -> strong, and
+    // 'x*foo**bar**' -> strong). Two guards: the closer must be
+    // exactly '**' (n == 2 — a '***' closer has enough for a strong
+    // AND an em, so the strong forms first: '*foo**bar***'), and
+    // there must be NO later same-char closer in this parent (if
+    // the single '*' has a later closer, the '**' forms the strong
+    // and the em closes later: '*(**foo**)*', '*foo **bar** baz*').
+    // Pre-scan for the nearest pure-opener single '*' in this parent;
+    // if one exists, a '**' opener after it is skipped so the closer
+    // reaches the single '*'.
+    let singlePureIdx = -1;
+    if (d.c !== 126 && d.n === 2 && !d.o && d.l) {
+      let hasLaterCloser = false;
+      for (let xi = di + 1; xi < delims.length; xi++) {
+        const x = delims[xi];
+        if (x.c !== d.c || !x.a || !x.l) continue;
+        if (x.nd.pa !== d.nd.pa) continue;
+        hasLaterCloser = true;
+        break;
+      }
+      if (!hasLaterCloser) {
+        for (let xi = di - 1; xi >= 0; xi--) {
+          const x = delims[xi];
+          if (x.c !== d.c || !x.a || !x.o || x.l || x.n !== 1) continue;
+          if (x.nd.pa !== d.nd.pa) continue;
+          singlePureIdx = xi;
+          break;
+        }
+      }
+    }
     let oi = di - 1;
+    let usedSinglePure = false;
     while (oi >= 0) {
       const o = delims[oi];
       if (!o.a || o.c !== d.c || !o.o || o.nd.pa !== d.nd.pa) { oi--; continue; }
+      // Skip a '**' opener only when it can BOTH open and close
+      // (preceded by a word char). A pure-opener '**' (preceded by a
+      // space/punctuation, can only open) is a legitimate strong
+      // opener and must not be hijacked ('*first **option**_.' keeps
+      // its strong; '*foo**bar**' forms the em because its inner
+      // '**' sits between word chars).
+      if (singlePureIdx >= 0 && o.n >= 2 && oi > singlePureIdx && o.o && o.l) { usedSinglePure = true; oi--; continue; }
       // odd-match rule (only * and _): when either side can both open and
       // close, the sum of the lengths must not be a multiple of 3 unless
       // both lengths are.
       if (d.c !== 126) {
         const bothCan = (o.o && o.l) || (d.o && d.l);
-        if (bothCan && ((o.n + d.n) % 3 === 0) && !((o.n % 3 === 0) && (d.n % 3 === 0))) {
+        if (bothCan && ((o.on + d.on) % 3 === 0) && !((o.on % 3 === 0) && (d.on % 3 === 0))) {
           oi--; continue;
         }
       }
-      const use = (o.n >= 2 && d.n >= 2) ? 2 : 1;
+      const openLen = o.n, closeLen = d.n;
+      let use = (o.n >= 2 && d.n >= 2) ? 2 : 1;
       // marked emphasis quirk (not in the spec algorithm): an inner
-      // emphasis whose closer is immediately followed by a word character,
-      // and whose opener can only open (it is preceded by a space, not a
-      // word char), blocks an outer emphasis of a DIFFERENT length.
-      // '**a *b*c d**' stays literal ('**a <em>b</em>c d**'), while
-      // '**a*b*c d**' forms ('<strong>a<em>b</em>c d</strong>'), and
-      // '**a *b* c**' (space after the inner closer) forms too. The
-      // inner emphasis is already formed when the outer closer is
-      // processed, so its closer carries op (the opener it matched) and
-      // ul (how many delimiters it used). Two limits: the block only
-      // fires when the closer run is exactly consumed (d.n === use — a
-      // longer run splits, the extra delimiter going literal inside, so
-      // '**a *b*c***' still forms '<strong>a <em>b</em>c*</strong>'),
-      // and each inner closer blocks only the FIRST closer after it
-      // (a later '**' can still pair with the outer opener, so
-      // '**a *b*c** d**' forms '<strong>a <em>b</em>c** d</strong>').
-      if (d.c !== 126 && d.n === use) {
-        let blocked = false;
+      // emphasis whose closer is immediately followed by a word
+      // character, and whose opener can only open (preceded by a
+      // space, not a word char), blocks an outer emphasis. Measured
+      // grid (inner '*b*c', opener length O, closer length C):
+      //   O=1: outer always forms (em); O=2,C=3: strong forms;
+      //   O=3,C=3: em forms (fallback); all other O>=2: blocked.
+      // The block applies when the opener has length >= 2 and the
+      // closer is exactly consumed (d.n === use) or the opener keeps
+      // a leftover (o.n > use); a same-length inner (ul === use) does
+      // not block when the closer keeps a leftover (d.n > use). The
+      // inner closer must have matched a DIFFERENT opener than the
+      // current one (x.op !== o — a strong formed from this opener
+      // does not block a later em wrapping it: '***foo**bar*'), and
+      // each inner closer blocks only the FIRST closer after it
+      // (x.bl). A *** closer blocked from a strong can still form an
+      // em when both runs have length >= 3 ('***a *b*c***').
+      // hasInner records whether such an inner emphasis sits between
+      // the opener and closer at all (it also decides leftover
+      // placement below, even when it does not block this pair).
+      let blocked = false;
+      let hasInner = false;
+      let hasInnerAlnum = false;
+      if (d.c !== 126) {
         for (let xi = oi + 1; xi < di; xi++) {
           const x = delims[xi];
-          // only an inner emphasis of the SAME delimiter char blocks
-          // (an inner ** must not block an outer _ : doc-05/21/31)
-          if (x.c !== d.c) continue;
-          if (!x.op || x.bl || x.ul === use) continue;
+          if (x.c !== d.c || !x.op || x.op === o) continue;
           if (!(x.op.o && !x.op.l)) continue;
           if (!isAlnum(x.after)) continue;
-          x.bl = true;
-          blocked = true;
+          hasInner = true;
           break;
         }
-        if (blocked) { oi--; continue; }
+        // Broader, for the CLOSER leftover only: an inner STRONG
+        // (ul === 2, a different opener) whose closer is followed by
+        // a word char pulls the closer leftover inside
+        // ('*foo**bar**qux**' -> '<em>foo<strong>bar</strong>qux*</em>'),
+        // even when its opener can both open and close. An inner EM
+        // (ul === 1) does NOT ('*a *b*c**' ->
+        // '<em>a <em>b</em>c</em>*', leftover outside), and without
+        // the word char after the inner closer the leftover stays
+        // outside ('*a **b** c**' -> '<em>a <strong>b</strong> c</em>*').
+        // No opener-length requirement (openLen 1 is enough here).
+        for (let xi = oi + 1; xi < di; xi++) {
+          const x = delims[xi];
+          if (x.c !== d.c || !x.op || x.op === o) continue;
+          if (x.ul !== 2) continue;
+          if (!isAlnum(x.after)) continue;
+          hasInnerAlnum = true;
+          break;
+        }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          blocked = false;
+          for (let xi = oi + 1; xi < di; xi++) {
+            const x = delims[xi];
+            if (x.c !== d.c) continue;
+            if (!x.op || x.bl || x.op === o) continue;
+            if (!(x.op.o && !x.op.l)) continue;
+            if (!isAlnum(x.after)) continue;
+            // Block rule (measured grid): an inner emphasis whose
+            // closer is followed by a word char blocks the outer one
+            // when it used MORE than the outer would (ul > use) and
+            // the closer is exactly consumed ('*a **b**c d*' stays
+            // literal); when it used FEWER (ul < use), the opener has
+            // length >= 2, and the closer is exactly consumed or the
+            // opener keeps a leftover ('**a *b*c d**' literal,
+            // '***a *b*c***' strong blocked); or when it used the
+            // SAME single delimiter (ul === use === 1), the opener
+            // has length >= 2, and the closer is exactly consumed
+            // ('**public *so*other*' literal). A same-length strong
+            // inner never blocks a strong outer
+            // ('**a **b**c d**' forms).
+            let blockThis = false;
+            if (x.ul > use && d.n === use) blockThis = true;
+            else if (x.ul < use && o.n >= 2 && (d.n === use || o.n > use)) blockThis = true;
+            else if (x.ul === 1 && use === 1 && o.n >= 2 && d.n === use) blockThis = true;
+            if (!blockThis) continue;
+            x.bl = true;
+            blocked = true;
+            break;
+          }
+          if (!blocked) break;
+          if (use === 2 && o.n >= 3 && d.n >= 3) { use = 1; continue; }
+          break;
+        }
       }
+      if (blocked) { oi--; continue; }
       const t = d.c === 126 ? N_DEL : (use === 2 ? N_STRONG : N_EM);
       // wrap the nodes between the opener and the closer
       const emNode = mkNode(t, '', '', '');
       const firstChild = o.nd.nx;
       emNode.pa = o.nd.pa;
+      let lastChild = null;
       if (firstChild === d.nd) {
         emNode.ch = null; // empty emphasis: ** **
       } else {
         emNode.ch = firstChild;
-        const lastChild = d.nd.pv;
+        lastChild = d.nd.pv;
         let nd = firstChild;
         while (nd !== d.nd) { nd.pa = emNode; nd = nd.nx; }
         lastChild.nx = null; // terminate the child list
@@ -2777,6 +2882,64 @@ function processEmphasis(delims) {
       d.nd.s = d.nd.s.slice(use);
       o.n -= use;
       d.n -= use;
+      // When the closer reached a pure-opener single '*' by skipping a
+      // nearer '**' opener, the closer's leftover goes literal INSIDE
+      // the emphasis ('*foo**bar**' -> '<em>foo**bar*</em>'), not
+      // outside as usual ('*a c**' -> '<em>a c</em>*'). The used
+      // delimiter is the LAST char of the closer run, so the leftover
+      // (the first chars) is already inside the em's span.
+      if (usedSinglePure && d.n > 0) {
+        const lt = mkNode(N_TEXT, d.nd.s, '', '');
+        lt.pa = emNode;
+        if (lastChild) { lastChild.nx = lt; lt.pv = lastChild; }
+        else emNode.ch = lt;
+        d.nd.s = '';
+        d.n = 0;
+      }
+      // Leftover placement: when a qualifying inner emphasis sits
+      // between the opener and closer and the opener had length >= 2,
+      // a leftover delimiter goes literal INSIDE the emphasis
+      // ('**a *b*c***' -> '<strong>a <em>b</em>c*</strong>',
+      // '***a *b*c***' -> '<em>**a <em>b</em>c**</em>'); otherwise
+      // it stays outside ('**a c***' -> '<strong>a c</strong>*',
+      // '*a *b*c**' -> '<em>a <em>b</em>c</em>*').
+      if (hasInner && openLen >= 2) {
+        if (o.n > 0) {
+          const lt = mkNode(N_TEXT, o.nd.s, '', '');
+          lt.pa = emNode;
+          lt.nx = emNode.ch;
+          if (emNode.ch) emNode.ch.pv = lt;
+          emNode.ch = lt;
+          if (!lastChild) lastChild = lt;
+          o.nd.s = '';
+          // The moved text is rendered already, so its delimiter
+          // run is consumed: set its count to 0 or the loop below
+          // would re-match it into a spurious second emphasis
+          // around this one.
+          o.n = 0;
+        }
+        if (d.n > 0) {
+          const lt = mkNode(N_TEXT, d.nd.s, '', '');
+          lt.pa = emNode;
+          if (lastChild) { lastChild.nx = lt; lt.pv = lastChild; }
+          else emNode.ch = lt;
+          d.nd.s = '';
+          d.n = 0;
+        }
+      }
+      // Closer leftover: inside when any inner emphasis sits between
+      // the opener and closer and its closer is followed by a word
+      // char (hasInnerAlnum, broader than hasInner — the inner
+      // opener need not be a pure opener, and the outer opener may
+      // have length 1). Otherwise it stays outside.
+      if (hasInnerAlnum && d.n > 0) {
+        const lt = mkNode(N_TEXT, d.nd.s, '', '');
+        lt.pa = emNode;
+        if (lastChild) { lastChild.nx = lt; lt.pv = lastChild; }
+        else emNode.ch = lt;
+        d.nd.s = '';
+        d.n = 0;
+      }
       // record the match on the closer for the marked emphasis quirk
       // (see the blocking check above): the next outer closer can tell
       // this closer matched `o` with `use` delimiters.
