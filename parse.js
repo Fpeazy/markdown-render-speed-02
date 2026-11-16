@@ -996,7 +996,22 @@ function parseBlocks(src) {
         if (ccur(cur) === 62) {
           advOne(cur);
           const ch = ccur(cur);
-          if (ch === 32 || ch === 9) adv(cur, 1);
+          if (ch === 32) adv(cur, 1);
+          else if (ch === 9) {
+            // A tab after '>' is the optional single space, but its
+            // width is measured at the EFFECTIVE column (as if only
+            // this innermost blockquote existed), not the absolute
+            // column: in a list item, '  >\tX' has the tab at absolute
+            // col 3 (width 1) but effective col 1 (width 3), so
+            // consuming 1 leaves 2 spaces (doc-08/doc-30). contTotal
+            // here is still the OUTER containers' widths (this
+            // blockquote not yet added), so the effective column is
+            // cur.c - contTotal.
+            const effCol = cur.c - contTotal;
+            const w = 4 - (effCol & 3);
+            if (w > 1) { cur.p = w - 1; cur.c += 1; }
+            else { cur.i++; cur.c += 1; }
+          }
           const w = cur.c - bc0;
           bqTotal += w; bqLast = w;
           contTotal += w; contLast = w;
@@ -1356,7 +1371,20 @@ function parseBlocks(src) {
       // markers subtracted); the list-item indent is NOT subtracted here.
       // (The generalised correction was tried and regressed the count
       // 710/720 -> 686/720; it is wrong for fenced-code content.)
-      leaf.lines.push(k > 1 ? expandLeadTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
+      // Round 4: when the innermost container is a blockquote, marked
+      // aligns tab stops as if only that blockquote existed, so ALL
+      // outer containers (lists included) are subtracted
+      // (contTotal-contLast; doc-08 '  > \tX' in a list item expands
+      // the tab to 2 spaces, not 4). When the innermost container is
+      // a list (or none), only outer '>' markers are subtracted
+      // (bqTotal-bqLast); subtracting an outer blockquote there would
+      // under-expand (doc-02 '>   \tX' in a list inside a quote
+      // needs the absolute column, 4 spaces). The blanket
+      // contTotal-contLast correction regressed 710/720 -> 686/720
+      // because it also subtracts outer blockquotes under a list.
+      const innerIsQuote = k > 1 && stack[k - 1].t === T_QUOTE;
+      const tabCol = innerIsQuote ? cur.c - (contTotal - contLast) : cur.c - (bqTotal - bqLast);
+      leaf.lines.push(k > 1 ? expandLeadTabs(codeText, tabCol) : codeText);
       leaf.hasContent = true;
       continue;
     }
