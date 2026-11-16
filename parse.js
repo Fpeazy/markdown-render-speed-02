@@ -461,7 +461,7 @@ function closeContainer(P, node) {
 // content (fenced code, indented code, HTML block types 1-6), append it.
 // Otherwise close a paragraph/table, and mark that a blank line was seen
 // (for list tightness).
-function handleBlank(P, leafReachable, c) {
+function handleBlank(P, leafReachable, c, markerOnly) {
   const leaf = P.leaf;
   if (leafReachable && leaf) {
     if (leaf.t === 'fence') {
@@ -491,7 +491,14 @@ function handleBlank(P, leafReachable, c) {
   // line) and is followed by a blank line also loses its trailing newline
   const lb = P.lastBlock;
   if (lb && lb.t === 'html' && lb.s.endsWith('\n')) lb.s = lb.s.slice(0, -1);
-  P.pendBlank = true;
+  // a blank line closes an empty list item (it has no content to continue)
+  const top = P.open[P.open.length - 1];
+  if (top && top.t === 'item' && top.ch.length === 0) {
+    closeContainer(P, P.open.pop());
+  }
+  // a line that is only container markers (e.g. `>`) is not a real blank
+  // line for list looseness: it does not make a list loose
+  if (!markerOnly) P.pendBlank = true;
 }
 
 // Parse link reference definitions from the start of a paragraph's text.
@@ -1321,6 +1328,10 @@ function parseBlocks(src) {
     // quote marker plus two spaces) is NOT blank: its content is the
     // single space left after the marker's separator space.
     const isBlank = rawBlank || curRest(c) === '';
+    // a blank line that is only container markers (e.g. `>`) has no
+    // content after the markers, so it is not a real blank line for
+    // list looseness
+    const markerOnly = isBlank && !rawBlank;
     if (P.leaf !== null && !leafReachable) {
       // an HTML block of kind 6-7 that ends because a blank line closed
       // its container loses its trailing newline, as if the blank line
@@ -1331,7 +1342,7 @@ function parseBlocks(src) {
       closeLeaf(P);
     }
     if (isBlank) {
-      handleBlank(P, leafReachable, c);
+      handleBlank(P, leafReachable, c, markerOnly);
       continue;
     }
     const wasBlank = P.pendBlank;
