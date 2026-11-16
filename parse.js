@@ -342,7 +342,7 @@ function mkDoc() { return { t: 'doc', ch: [] }; }
 function mkPara() { return { t: 'para', s: '', lines: 0 }; }
 function mkHead(l) { return { t: 'head', l, s: '' }; }
 function mkCode() { return { t: 'code', s: '' }; }
-function mkFence(ch, len, info) { return { t: 'fence', ch, len, info, s: '' }; }
+function mkFence(ch, len, info, indent) { return { t: 'fence', ch, len, info, indent, s: '' }; }
 function mkHtml(kind, endRe) { return { t: 'html', kind, endRe, s: '' }; }
 function mkQuote() { return { t: 'quote', ch: [] }; }
 function mkList(ordered, start) { return { t: 'list', o: ordered, st: start, tight: true, ch: [], blank: false }; }
@@ -464,7 +464,8 @@ function handleBlank(P, leafReachable, c) {
   const leaf = P.leaf;
   if (leafReachable && leaf) {
     if (leaf.t === 'fence') {
-      leaf.s += '\n';
+      // a blank line inside a fence keeps its spaces (no indent removal)
+      leaf.s += curRest(c) + '\n';
       return;
     }
     if (leaf.t === 'code') {
@@ -474,13 +475,15 @@ function handleBlank(P, leafReachable, c) {
       leaf.s += curRest(c) + '\n';
       return;
     }
-    if (leaf.t === 'html' && leaf.kind <= 6) {
+    if (leaf.t === 'html' && leaf.kind <= 5) {
       leaf.s += '\n';
       return;
     }
   }
-  // a blank line ends a paragraph or a table
-  if (leafReachable && leaf && (leaf.t === 'para' || leaf.t === 'table')) {
+  // a blank line ends a paragraph, a table, or an HTML block of kind 6-7
+  if (leafReachable && leaf && (leaf.t === 'para' || leaf.t === 'table' || leaf.t === 'html')) {
+    // an HTML block that ends at a blank line loses its trailing newline
+    if (leaf.t === 'html' && leaf.s.endsWith('\n')) leaf.s = leaf.s.slice(0, -1);
     closeLeaf(P);
   }
   P.pendBlank = true;
@@ -739,11 +742,11 @@ function stripAtxClose(s) {
 }
 
 // Fenced code start: ``` or ~~~ (3+), up to 3 leading spaces. Returns
-// { ch, len, info } or null. A backtick fence's info string may not
-// contain a backtick.
+// { ch, len, info, indent } or null. A backtick fence's info string may not
+// contain a backtick. indent is the leading whitespace columns (0-3).
 function fenceStart(c) {
   const saveI = c.i, saveCol = c.col, saveS = c.s;
-  curSkipWs(c, 3);
+  const indent = curSkipWs(c, 3);
   const ch = curPeek(c);
   if (ch !== 96 && ch !== 126) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   const n = runLen(c, ch);
@@ -752,7 +755,7 @@ function fenceStart(c) {
   if (ch === 96 && info.indexOf('`') >= 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   c.i += n;
   c.col += n;
-  return { ch, len: n, info };
+  return { ch, len: n, info, indent };
 }
 // Fenced code end: a run of the fence char, length >= fence.len, followed
 // by only spaces/tabs.
@@ -782,18 +785,19 @@ function htmlStart(c, canInterrupt) {
   let i = c.i + 1;
   const n = s.length;
   // comment
-  if (s.startsWith('!--', i)) return { kind: 2, end: '-->' };
+  if (s.startsWith('!--', i)) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 2, end: '-->' }; }
   // processing instruction
-  if (i < n && s.charCodeAt(i) === 63) return { kind: 3, end: '?>' };
+  if (i < n && s.charCodeAt(i) === 63) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 3, end: '?>' }; }
   // declaration <!A-Z
   if (i < n && s.charCodeAt(i) === 33 && i + 1 < n && isAlpha(s.charCodeAt(i + 1))) {
-    return { kind: 4, end: '>' };
+    c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 4, end: '>' };
   }
   // CDATA
-  if (s.startsWith('![CDATA[', i)) return { kind: 5, end: ']]>' };
+  if (s.startsWith('![CDATA[', i)) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 5, end: ']]>' }; }
   // tag (open or close)
   let j = i;
-  if (j < n && s.charCodeAt(j) === 47) j++;
+  const closing = j < n && s.charCodeAt(j) === 47;
+  if (closing) j++;
   if (j >= n || !isAlpha(s.charCodeAt(j))) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   const nameStart = j;
   while (j < n && (isAlnum(s.charCodeAt(j)) || s.charCodeAt(j) === 45)) j++;
@@ -805,11 +809,14 @@ function htmlStart(c, canInterrupt) {
       c.i = saveI; c.col = saveCol; c.s = saveS; return null;
     }
   }
-  if (NOT_BLOCK_TAG.has(name)) return { kind: 1, end: '</' + name };
-  if (BLOCK_TAGS.has(name)) return { kind: 6, end: null };
+  // only an opening tag starts a type-1 block; a closing tag for one of
+  // these is a plain (type-7) tag and cannot interrupt a paragraph
+  if (NOT_BLOCK_TAG.has(name) && !closing) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 1, end: '</' + name }; }
+  if (BLOCK_TAGS.has(name)) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 6, end: null }; }
   if (!canInterrupt) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   // type 7: any other tag, but only when the tag is complete on this line
   if (parseHtmlTag(s, c.i) === 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
+  c.i = saveI; c.col = saveCol; c.s = saveS;
   return { kind: 7, end: null };
 }
 
@@ -1025,7 +1032,7 @@ function startNewBlock(P, c, container, wasBlank) {
   // fenced code
   const fs = fenceStart(c);
   if (fs !== null) {
-    const fence = mkFence(fs.ch, fs.len, fs.info);
+    const fence = mkFence(fs.ch, fs.len, fs.info, fs.indent);
     addChild(P, container, fence, wasBlank);
     P.leaf = fence;
     P.leafParent = container;
@@ -1141,6 +1148,8 @@ function processLine(P, c, leafReachable, wasBlank) {
   if (leafReachable && leaf) {
     if (leaf.t === 'fence') {
       if (fenceEnd(c, leaf)) { closeLeaf(P); return; }
+      // content lines lose up to the opening fence's indent
+      curSkipWs(c, leaf.indent);
       leaf.s += curRest(c) + '\n';
       return;
     }
