@@ -423,6 +423,7 @@ function addChild(P, par, block, wasBlank) {
     }
   }
   par.ch.push(block);
+  P.lastBlock = block;
 }
 
 // Finalise an open leaf. Paragraphs are scanned for link reference
@@ -527,8 +528,10 @@ function parseLinkDef(s) {
   if (i >= n) return null;
   // destination: <...> or a bare run (no spaces, no control chars)
   let dest = '';
+  let angleDest = false;
   if (s.charCodeAt(i) === 60) {
     // <...>
+    angleDest = true;
     let j = i + 1;
     let d = '';
     while (j < n) {
@@ -557,44 +560,45 @@ function parseLinkDef(s) {
     dest = d;
     i = j;
   }
+  // after an angle-bracket destination the title must be separated by
+  // whitespace; a title opener tight against the `>` is not a title and
+  // the definition is invalid (e.g. `[foo]: <bar>(baz)`)
+  if (angleDest && i < n) {
+    const cc = s.charCodeAt(i);
+    if (cc !== 32 && cc !== 9 && cc !== 10) return null;
+  }
+  const afterDest = i;
   // optional title on the same line or the next line (one newline allowed)
   let title = null;
-  let j = i;
-  j = skipWsNl(s, j);
-  if (j < n) {
-    const tc = s.charCodeAt(j);
-    if (tc === 34 || tc === 39 || tc === 40) {
-      const t = parseTitle(s, j);
-      if (t !== null) {
-        title = t.title;
-        j = t.end;
+  let titleEnd = -1;
+  {
+    let j = skipWsNl(s, i);
+    if (j < n) {
+      const tc = s.charCodeAt(j);
+      if (tc === 34 || tc === 39 || tc === 40) {
+        const t = parseTitle(s, j);
+        if (t !== null) {
+          // the title must be followed by only whitespace to end of line
+          let m = t.end;
+          while (m < n && (s.charCodeAt(m) === 32 || s.charCodeAt(m) === 9)) m++;
+          if (m >= n || s.charCodeAt(m) === 10) {
+            title = t.title;
+            titleEnd = t.end;
+          }
+          // otherwise the title is invalid and is dropped (the definition
+          // itself stays valid without it)
+        }
       }
     }
   }
-  // after the definition, only whitespace (and one newline) may follow
-  // before the next definition or the paragraph's real content
-  let k = j;
-  // skip spaces/tabs on this line
+  // the definition ends after the destination, or after the title when
+  // one was accepted. Without a title, nothing but whitespace may follow
+  // the destination on its line. The rest is the paragraph's content.
+  let endPos = title !== null ? titleEnd : afterDest;
+  let k = endPos;
   while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9)) k++;
+  if (title === null && k < n && s.charCodeAt(k) !== 10) return null;
   if (k < n && s.charCodeAt(k) === 10) k++;
-  // the definition must be followed by a blank line, another definition,
-  // or the end of the paragraph text
-  if (k < n) {
-    // if there's more content, it must start a new definition or be blank
-    // (we already consumed one newline; the next thing must be a `[` or
-    // the end). Actually the next line must either be blank or start with
-    // up to 3 spaces and `[`. We check by peeking: if the remaining text
-    // does not start (after optional spaces) with `[`, this was not a
-    // valid definition unless the rest is only whitespace.
-    let p = k;
-    let sp2 = 0;
-    while (p < n && s.charCodeAt(p) === 32 && sp2 < 3) { p++; sp2++; }
-    if (p >= n) {
-      // only trailing whitespace: fine, definition consumes everything
-      return { label: label.label, dest, title, rest: '' };
-    }
-    if (s.charCodeAt(p) !== 91) return null;
-  }
   return { label: label.label, dest, title, rest: s.slice(k) };
 }
 
@@ -984,6 +988,9 @@ function startsInterruptingBlock(c, inPara) {
   const h = htmlStart(c, inPara);
   if (h !== null && h.kind <= 6) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
   if (isThematicBreak(c)) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
+  // a blockquote start also interrupts a paragraph
+  const q = mkQuote();
+  if (matchQuote(c, q)) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
   const ls = listStart(c);
   if (ls !== null) {
     if (!ls.ordered || ls.start === 1) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
@@ -995,6 +1002,9 @@ function startsInterruptingBlock(c, inPara) {
 // Start a new block at the cursor, as a child of `container`.
 // `wasBlank` records whether a blank line preceded this line.
 function startNewBlock(P, c, container, wasBlank) {
+  // nothing starts on a blank remainder (e.g. a line that was only a
+  // blockquote marker, or an empty list item's content)
+  if (curBlank(c)) return;
   // A non-item block cannot be a direct child of a list. If the container
   // is a list and this line does not start an item belonging to it, close
   // the list and use its parent instead. A thematic break ends the list
@@ -1187,12 +1197,23 @@ function processLine(P, c, leafReachable, wasBlank) {
     if (leaf.t === 'para') {
       const sl = setextLevel(c);
       if (sl > 0) {
-        const head = mkHead(sl);
-        head.s = leaf.s.trim();
-        const par = leaf._parent;
-        par.ch[par.ch.indexOf(leaf)] = head;
-        P.leaf = null;
-        P.leafParent = null;
+        // link reference definitions are stripped before the paragraph
+        // becomes a heading; a paragraph that was only definitions does
+        // not become a heading at all, and this line starts a new block
+        const res = stripLinkRefs(leaf.s, P.refs);
+        const text = res.text.trim();
+        if (text !== '') {
+          const head = mkHead(sl);
+          head.s = text;
+          const par = leaf._parent;
+          par.ch[par.ch.indexOf(leaf)] = head;
+          P.leaf = null;
+          P.leafParent = null;
+          return;
+        }
+        leaf.s = res.text;
+        closeLeaf(P);
+        startNewBlock(P, c, P.open[P.open.length - 1], wasBlank);
         return;
       }
       if (leaf.lines === 1) {
@@ -1236,6 +1257,7 @@ function parseBlocks(src) {
   P.open = [P.root];
   for (let ln = 0; ln < lines.length; ln++) {
     const c = curOf(lines[ln]);
+    const rawBlank = lines[ln].trim() === '';
     let lastMatched = 0;
     for (let k = 1; k < P.open.length; k++) {
       const b = P.open[k];
@@ -1271,16 +1293,21 @@ function parseBlocks(src) {
       closeContainer(P, P.open.pop());
     }
     const leafReachable = P.leaf !== null && P.leafParent === P.open[lastMatched];
+    // a line is blank when the raw line is all whitespace, or when the
+    // content left after the containers is empty. A line like `>  ` (a
+    // quote marker plus two spaces) is NOT blank: its content is the
+    // single space left after the marker's separator space.
+    const isBlank = rawBlank || curRest(c) === '';
     if (P.leaf !== null && !leafReachable) {
       // an HTML block of kind 6-7 that ends because a blank line closed
       // its container loses its trailing newline, as if the blank line
       // had ended it directly
-      if (curBlank(c) && P.leaf.t === 'html' && (P.leaf.kind === 6 || P.leaf.kind === 7) && P.leaf.s.endsWith('\n')) {
+      if (isBlank && P.leaf.t === 'html' && (P.leaf.kind === 6 || P.leaf.kind === 7) && P.leaf.s.endsWith('\n')) {
         P.leaf.s = P.leaf.s.slice(0, -1);
       }
       closeLeaf(P);
     }
-    if (curBlank(c)) {
+    if (isBlank) {
       handleBlank(P, leafReachable, c);
       continue;
     }
