@@ -120,17 +120,18 @@ function entityEnd(s, i) {
   if (i + 1 >= n) return 0;
   const c1 = s.charCodeAt(i + 1);
   if (c1 === 35) {
-    // numeric
+    // numeric: decimal 1-7 digits, hex 1-6 digits (HTML spec limits);
+    // longer is not an entity reference at all
     let j = i + 2;
     if (j < n && (s.charCodeAt(j) === 120 || s.charCodeAt(j) === 88)) {
       j++;
       const st = j;
       while (j < n && isHex(s.charCodeAt(j))) j++;
-      if (j === st) return 0;
+      if (j === st || j - st > 6) return 0;
     } else {
       const st = j;
       while (j < n && isDigit(s.charCodeAt(j))) j++;
-      if (j === st) return 0;
+      if (j === st || j - st > 7) return 0;
     }
     if (j < n && s.charCodeAt(j) === 59) return j + 1;
     return 0;
@@ -179,6 +180,7 @@ function decodeNumeric(s, i) {
   const st = j;
   while (j < n && (hex ? isHex(s.charCodeAt(j)) : isDigit(s.charCodeAt(j)))) j++;
   if (j === st || j >= n || s.charCodeAt(j) !== 59) return null;
+  if (hex ? j - st > 6 : j - st > 7) return null;
   const cp = numericCodePoint(s.slice(st, j), hex);
   return [cp < 0 ? '\uFFFD' : String.fromCodePoint(cp), j + 1];
 }
@@ -302,6 +304,25 @@ function curSkipWs(c, maxN) {
     } else break;
   }
   return n;
+}
+// Expand tabs in the leading whitespace at the cursor into spaces,
+// without moving the cursor. Paragraph text keeps its leading whitespace
+// (it is part of the content); only the containers' indentation is
+// consumed before the cursor reaches here.
+function expandLeadTabs(c) {
+  let i = c.i;
+  let col = c.col;
+  while (i < c.s.length) {
+    const ch = c.s.charCodeAt(i);
+    if (ch === 32) { col++; i++; }
+    else if (ch === 9) {
+      const w = 4 - (col % 4);
+      c.s = c.s.slice(0, i) + ' '.repeat(w) + c.s.slice(i + 1);
+      col += w;
+      i += w;
+    }
+    else break;
+  }
 }
 function curBlank(c) {
   let i = c.i;
@@ -699,15 +720,16 @@ function atxLevel(c) {
   c.col += n;
   return n;
 }
-// Strip a closing ATX sequence (spaces + #'s + spaces) from heading text.
+// Strip a closing ATX sequence (spaces + #'s + spaces) from heading text,
+// and always strip trailing whitespace.
 function stripAtxClose(s) {
   let end = s.length;
   while (end > 0 && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end--;
   let i = end;
   while (i > 0 && s.charCodeAt(i - 1) === 35) i--;
-  if (i === end) return s;
+  if (i === end) return s.slice(0, end);
   // the #'s must be preceded by a space/tab (or be the whole text)
-  if (i > 0 && s.charCodeAt(i - 1) !== 32 && s.charCodeAt(i - 1) !== 9) return s;
+  if (i > 0 && s.charCodeAt(i - 1) !== 32 && s.charCodeAt(i - 1) !== 9) return s.slice(0, end);
   let j = i;
   while (j > 0 && (s.charCodeAt(j - 1) === 32 || s.charCodeAt(j - 1) === 9)) j--;
   return s.slice(0, j);
@@ -1028,8 +1050,8 @@ function startNewBlock(P, c, container, wasBlank) {
     P.leafParent = container;
     return;
   }
-  // paragraph
-  curSkipWs(c, 3);
+  // paragraph: the leading whitespace is part of the text, not stripped
+  expandLeadTabs(c);
   const para = mkPara();
   para.s = curRest(c);
   para.lines = 1;
@@ -1156,7 +1178,7 @@ function processLine(P, c, leafReachable, wasBlank) {
       if (startsInterruptingBlock(c, true)) {
         closeLeaf(P);
       } else {
-        curSkipWs(c, 3);
+        expandLeadTabs(c);
         leaf.s += '\n' + curRest(c);
         leaf.lines++;
         return;
@@ -1260,14 +1282,15 @@ function parseInlineLink(s, i) {
     dest = d;
     j = k + 1;
   } else {
-    // bare destination: no spaces, no control chars; parens must balance
+    // bare destination: no spaces, no control chars; parens must balance.
+    // It ends at whitespace (a title may follow) or at the closing `)`.
     let k = j;
     let d = '';
     let depth = 0;
     let ok = false;
     while (k < n) {
       const ch = s.charCodeAt(k);
-      if (ch === 32 || ch === 9 || ch === 10) break;
+      if (ch === 32 || ch === 9 || ch === 10) { ok = true; break; }
       if (ch === 40) { depth++; d += '('; k++; continue; }
       if (ch === 41) {
         if (depth === 0) { ok = true; break; }
@@ -1837,6 +1860,7 @@ function renderInline(text, refs) {
     }
     // close bracket: try to form a link
     if (ch === 93) {
+      flushText();
       const end = tryLink(i);
       if (end < 0) {
         buf += ']';
@@ -1990,6 +2014,22 @@ function unescapeHtml(s) {
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
+// Remove backslash escapes: a `\` before an ASCII punctuation character
+// drops the backslash and keeps the character; otherwise the `\` stays.
+function unescapeBackslash(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    if (ch === 92 && i + 1 < s.length && isPunct(s.charCodeAt(i + 1))) {
+      out += s[i + 1];
+      i++;
+    } else {
+      out += s[i];
+    }
+  }
+  return out;
+}
+
 // Is this opener/closer pair blocked by the rule of three? o is the
 // opener, d is the closer. For `*`/`_`: both must be ambiguous, the
 // opener must be unused, and (opener original length + closer length)
@@ -2091,7 +2131,7 @@ function renderBlock(b, refs) {
     case 'code': return '<pre><code>' + escText(b.s) + '</code></pre>\n';
     case 'fence': {
       let s = '<pre><code';
-      const lang = b.info.split(/\s+/)[0];
+      const lang = unescapeBackslash(b.info.split(/\s+/)[0]);
       if (lang !== '') s += ' class="language-' + escAttr(lang) + '"';
       return s + '>' + escText(b.s) + '</code></pre>\n';
     }
