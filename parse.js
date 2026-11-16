@@ -188,8 +188,31 @@ function decodeNumeric(s, i) {
 // Percent-encode a link destination the way marked does: encodeURI, then
 // entity-aware attribute escaping (so a bare `&` becomes `&amp;` while a
 // valid entity reference passes through).
+// Encode a URL the way marked does: encodeURI, except a `%` followed by
+// two hex digits is already a percent-encoding and is left as-is.
 function cleanUrl(url) {
-  return escAttr(encodeURI(url));
+  let out = '';
+  let i = 0;
+  const n = url.length;
+  while (i < n) {
+    const ch = url.charCodeAt(i);
+    if (ch === 37 && i + 2 < n) {
+      const h1 = url.charCodeAt(i + 1);
+      const h2 = url.charCodeAt(i + 2);
+      const hex1 = (h1 >= 48 && h1 <= 57) || (h1 >= 65 && h1 <= 70) || (h1 >= 97 && h1 <= 102);
+      const hex2 = (h2 >= 48 && h2 <= 57) || (h2 >= 65 && h2 <= 70) || (h2 >= 97 && h2 <= 102);
+      if (hex1 && hex2) {
+        out += url.slice(i, i + 3);
+        i += 3;
+        continue;
+      }
+    }
+    let j = i + 1;
+    while (j < n && url.charCodeAt(j) !== 37) j++;
+    out += encodeURI(url.slice(i, j));
+    i = j;
+  }
+  return escAttr(out);
 }
 
 // Block tags that may start an HTML block of type 6 (block-level tags).
@@ -1849,11 +1872,22 @@ function renderInline(text, refs) {
     }
     // form the link: children are the nodes after the bracket node
     const kids = collectBetween(br.node, null);
+    // a (non-autolink) link inside the link text means the outer link
+    // does not form at all; put the children back and treat `]` as text
+    if (hasRealLink(kids.head)) {
+      if (kids.head !== null) {
+        br.node.next = kids.head;
+        kids.head.prev = br.node;
+        nodes.tail = kids.tail;
+      }
+      br.active = false;
+      return -1;
+    }
     // an autolink nested inside link text is flattened back to text
     let kd = kids.head;
     while (kd !== null) {
       const nx = kd.next;
-      if (kd.t === 'link') {
+      if (kd.t === 'link' && kd.auto) {
         const tn = { t: 'text', s: kd.textHtml, prev: kd.prev, next: kd.next };
         if (kd.prev) kd.prev.next = tn;
         else kids.head = tn;
@@ -2004,7 +2038,7 @@ function renderInline(text, refs) {
       if (al !== null) {
         flushText();
         const tn = { t: 'text', s: escAttr(al.text), prev: null, next: null };
-        appendNode({ t: 'link', href: cleanUrl(al.dest), title: null, chHead: tn, chTail: tn, textHtml: '' });
+        appendNode({ t: 'link', href: cleanUrl(al.dest), title: null, chHead: tn, chTail: tn, textHtml: '', auto: true });
         appendLinkText(nodes.tail);
         i = al.end;
         continue;
@@ -2063,7 +2097,7 @@ function renderInline(text, refs) {
       if (al !== null) {
         flushText();
         const tn = { t: 'text', s: escAttr(al.text), prev: null, next: null };
-        appendNode({ t: 'link', href: cleanUrl(al.href), title: null, chHead: tn, chTail: tn, textHtml: '' });
+        appendNode({ t: 'link', href: cleanUrl(al.href), title: null, chHead: tn, chTail: tn, textHtml: '', auto: true });
         appendLinkText(nodes.tail);
         i = al.end;
         continue;
@@ -2224,6 +2258,21 @@ function processEmphasis(delims, nodes, collectBetween) {
     }
     d = nextD;
   }
+}
+
+// Does a node list contain a (non-autolink) link anywhere, including
+// inside emphasis/strong/del children? Used to stop a link forming when
+// its text already contains a link.
+function hasRealLink(head) {
+  let nd = head;
+  while (nd !== null) {
+    if (nd.t === 'link' && !nd.auto) return true;
+    if ((nd.t === 'em' || nd.t === 'strong' || nd.t === 'del' || nd.t === 'link') && nd.chHead) {
+      if (hasRealLink(nd.chHead)) return true;
+    }
+    nd = nd.next;
+  }
+  return false;
 }
 
 function renderNodes(head) {
