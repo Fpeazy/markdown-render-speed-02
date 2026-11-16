@@ -2416,6 +2416,67 @@ function scanInline(s, refs) {
     return c === 32 || c === 9 || c === 10 || c === 42 || c === 95 || c === 126 || c === 40 || c === 60;
   }
 
+  // Will the '[' delimiter `open` form a link? Mirrors tryLink's decision
+  // WITHOUT mutating anything. Used to decide whether an extended
+  // autolink inside the brackets may form: marked autolinks inside
+  // brackets when the link FAILS (the '[' stays literal — doc-01, doc-39),
+  // but not when it forms (the URL stays plain text inside the link).
+  // fromPos is where the URL starts; the ']' that closes this '[' is the
+  // first unescaped ']' at or after fromPos (code spans skipped).
+  function bracketWillFormLink(open, fromPos) {
+    let closeIdx = -1;
+    let k = fromPos;
+    while (k < n) {
+      const ch = s.charCodeAt(k);
+      if (ch === 93) { closeIdx = k; break; }
+      if (ch === 92 && k + 1 < n && isAsciiPunct(s.charCodeAt(k + 1))) { k += 2; continue; }
+      if (ch === 96) {
+        let j = k;
+        while (j < n && s.charCodeAt(j) === 96) j++;
+        const len = j - k;
+        let m = j, found = -1;
+        while (m < n) {
+          if (s.charCodeAt(m) === 96) {
+            let q = m;
+            while (q < n && s.charCodeAt(q) === 96) q++;
+            if (q - m === len) { found = m; break; }
+            m = q;
+          } else m++;
+        }
+        if (found >= 0) { k = found + len; continue; }
+      }
+      k++;
+    }
+    if (closeIdx < 0) return false;
+    const next = closeIdx + 1 < n ? s.charCodeAt(closeIdx + 1) : -1;
+    let href = null;
+    let fullRefTried = false;
+    if (next === 40) {
+      const r = parseInlineLink(s, closeIdx + 1);
+      if (r) href = r.href;
+    } else if (next === 91) {
+      const r = parseRefLabel(s, closeIdx + 1);
+      if (r) {
+        fullRefTried = true;
+        const rawLabel = r.label === '' ? s.slice(open.ix, closeIdx) : r.label;
+        const ref = refs.get(normalizeLabel(unescapeLabel(rawLabel)));
+        if (ref) href = ref.href;
+      }
+    }
+    if (href === null && !fullRefTried) {
+      const ref = refs.get(normalizeLabel(unescapeLabel(s.slice(open.ix, closeIdx))));
+      if (ref) href = ref.href;
+    }
+    if (href === null) return false;
+    const linkText = s.slice(open.ix, closeIdx);
+    const badEnd = linkTextHasBadCodeSpan(linkText);
+    if (badEnd >= 0 && (next !== 40 || badEnd < linkText.length)) return false;
+    if (cleanUrl(href) === null) return false;
+    // a link cannot contain a (markdown) link
+    if (open.im !== 1 && containsLink(open.nd.nx)) return false;
+    return true;
+  }
+
   while (i < n) {
     const c = s.charCodeAt(i);
     if (c === 92) { // backslash
@@ -2568,15 +2629,24 @@ function scanInline(s, refs) {
       continue;
     }
     // extended autolinks: www. / scheme:// / email (only at a boundary,
-    // and not while an unclosed inline <a> is open — doc-03, and not
-    // inside link text while a '[' delimiter is active)
+    // and not while an unclosed inline <a> is open — doc-03). Inside a
+    // '[' the autolink forms only when that '[' will NOT form a link
+    // (marked autolinks inside brackets when the link fails; when the
+    // link forms, the URL stays plain text inside it — doc-01/39).
     let openBracket = false;
     let openUnd = false;
     if (!inLink && isExtBoundary(i) && (c === 119 || isAsciiLetter(c))) {
       for (let dk = 0; dk < delims.length; dk++) {
-        if (delims[dk].c === 91 && delims[dk].a) { openBracket = true; break; }
+        if (delims[dk].c === 91 && delims[dk].a) break;
         // canOpen is .o (mkDelim .a is always true = active flag)
         if (delims[dk].c === 95 && delims[dk].o) openUnd = true;
+      }
+      // innermost active '[': suppress only if it will form a link
+      for (let dk = delims.length - 1; dk >= 0; dk--) {
+        if (delims[dk].c === 91 && delims[dk].a) {
+          if (bracketWillFormLink(delims[dk], i)) openBracket = true;
+          break;
+        }
       }
     }
     if (!inLink && !openBracket && isExtBoundary(i) && (c === 119 || isAsciiLetter(c))) {
