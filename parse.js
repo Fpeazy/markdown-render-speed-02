@@ -2395,7 +2395,7 @@ function scanExtDomain(s, textStart, domStart, prefix, openUnd) {
 function renderInline(s, refs) {
   if (!hasSpecial(s)) return escText(s);
   const st = scanInline(s, refs);
-  processEmphasis(st.delims);
+  processEmphasis(st.delims, s);
   return renderNodes(st.head);
 }
 
@@ -2450,35 +2450,6 @@ function scanInline(s, refs) {
   // span before ']' ('[a `` b ` c ``](url)' forms, '[a `` b ` c `` d]'
   // and '[a `` b ` c ``_]' do not). A REFERENCE link is blocked by any
   // such span, wherever it sits (doc-18).
-  function linkTextHasBadCodeSpan(text) {
-    let i = 0;
-    const m = text.length;
-    while (i < m) {
-      if (text.charCodeAt(i) === 96) {
-        let j = i;
-        while (j < m && text.charCodeAt(j) === 96) j++;
-        const len = j - i;
-        let k = j;
-        let found = -1;
-        while (k < m) {
-          if (text.charCodeAt(k) === 96) {
-            let q = k;
-            while (q < m && text.charCodeAt(q) === 96) q++;
-            if (q - k === len) { found = k; break; }
-            k = q;
-          } else k++;
-        }
-        if (found >= 0) {
-          if (len >= 2 && text.slice(j, found).indexOf('`') >= 0) return found + len;
-          i = found + len;
-        } else {
-          i = j;
-        }
-      } else i++;
-    }
-    return -1;
-  }
-
   // Try to form a link/image at the ']' at s[closeIdx]. Returns the index
   // to continue scanning from, or -1 when no link was formed.
   function tryLink(closeIdx) {
@@ -2895,7 +2866,50 @@ function scanInline(s, refs) {
 }
 
 // Resolve emphasis / strong / strikethrough over the delimiter list.
-function processEmphasis(delims) {
+// marked quirk: a link whose text contains a code span delimited by 2+
+// backticks that itself contains a backtick does NOT form a link
+// (doc-18: [empty test `` a ` b `` output][all-40] stays literal; the
+// [all-40] then links on its own). A single-backtick span, or a 2+ span
+// with no backtick inside, forms normally. Returns the index just past
+// the closer of the first 2+ backtick code span whose content contains
+// a backtick, or -1 if there is none. A span like `` a ` b `` in link
+// text is a marked quirk: it blocks the link — but for an INLINE link
+// only when something follows the span before ']' ('[a `` b ` c ``](url)'
+// forms, '[a `` b ` c `` d]' and '[a `` b ` c ``_]' do not). A REFERENCE
+// link is blocked by any such span, wherever it sits (doc-18). The same
+// span inside '[...]' also blocks an EMPHASIS that contains it
+// (probe36/doc-16: '[at _node `` ` ``_](url)' keeps '_node ... _'
+// literal; outside brackets the emphasis forms normally).
+function linkTextHasBadCodeSpan(text) {
+  let i = 0;
+  const m = text.length;
+  while (i < m) {
+    if (text.charCodeAt(i) === 96) {
+      let j = i;
+      while (j < m && text.charCodeAt(j) === 96) j++;
+      const len = j - i;
+      let k = j;
+      let found = -1;
+      while (k < m) {
+        if (text.charCodeAt(k) === 96) {
+          let q = k;
+          while (q < m && text.charCodeAt(q) === 96) q++;
+          if (q - k === len) { found = k; break; }
+          k = q;
+        } else k++;
+      }
+      if (found >= 0) {
+        if (len >= 2 && text.slice(j, found).indexOf('`') >= 0) return found + len;
+        i = found + len;
+      } else {
+        i = j;
+      }
+    } else i++;
+  }
+  return -1;
+}
+
+function processEmphasis(delims, s) {
   for (let di = 0; di < delims.length; di++) {
     const d = delims[di];
     if (!d.a || !d.l) continue;
@@ -2960,6 +2974,33 @@ function processEmphasis(delims) {
         }
       }
       const openLen = o.n, closeLen = d.n;
+      // A bad code span (2+ backticks containing a backtick) inside
+      // '[...]' blocks an emphasis that contains it (probe36/doc-16:
+      // '[at _node `` ` ``_](url)' keeps '_node ... _' literal; outside
+      // brackets the emphasis forms normally). The content is the source
+      // between the opener run and the closer run; it is inside brackets
+      // when the nearest '[' before the opener has no ']' before the
+      // opener and a ']' after the closer.
+      let blockedByBadSpan = false;
+      if (s) {
+        const content = s.slice(o.ix + o.on, d.ix);
+        if (linkTextHasBadCodeSpan(content) >= 0) {
+          let b = -1;
+          for (let k = o.ix - 1; k >= 0; k--) {
+            const ch = s.charCodeAt(k);
+            if (ch === 93) break;
+            if (ch === 91 && (k === 0 || s.charCodeAt(k - 1) !== 92)) { b = k; break; }
+          }
+          if (b >= 0) {
+            for (let k = d.ix; k < s.length; k++) {
+              const ch = s.charCodeAt(k);
+              if (ch === 93 && (k === 0 || s.charCodeAt(k - 1) !== 92)) { blockedByBadSpan = true; break; }
+              if (ch === 91 && (k === 0 || s.charCodeAt(k - 1) !== 92)) break;
+            }
+          }
+        }
+      }
+      if (blockedByBadSpan) { oi--; continue; }
       let use = (o.n >= 2 && d.n >= 2) ? 2 : 1;
       // marked emphasis quirk (not in the spec algorithm): an inner
       // emphasis whose closer is immediately followed by a word
