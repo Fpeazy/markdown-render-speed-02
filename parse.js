@@ -1774,7 +1774,7 @@ function renderInline(text, refs) {
     }
   }
   function addDelim(cc, node, len, canOpen, canClose) {
-    const d = { cc, node, len, orig: len, canOpen, canClose, prev: delims.tail, next: null };
+    const d = { cc, node, len, orig: len, canOpen, canClose, usedAs: null, prev: delims.tail, next: null };
     if (delims.tail) delims.tail.next = d;
     else delims.head = d;
     delims.tail = d;
@@ -2190,11 +2190,12 @@ function processEmphasis(delims, nodes, collectBetween) {
         let found = null;
         while (o !== null) {
           if (o.len === 0) {
-            // a consumed delimiter that could open is a barrier for a
-            // closer that cannot open — unless the closer is the same
-            // length as the consumed delimiter was, in which case it may
-            // pass through to an opener beyond it (e.g. `*(*foo*)*`)
-            if (o.canOpen && !d.canOpen && d.len !== o.orig) break;
+            // a consumed delimiter is a barrier for a closer that cannot
+            // open only when it was itself used as a closer, and only
+            // when the closer is a different length than it was. A
+            // consumed opener never blocks (e.g. `*(**foo**)*`, where the
+            // outer `*` must pass the inner `**` opener to match).
+            if (o.canOpen && !d.canOpen && o.usedAs === 'close' && d.len !== o.orig) break;
             o = o.prev;
             continue;
           }
@@ -2214,6 +2215,8 @@ function processEmphasis(delims, nodes, collectBetween) {
         d.node.prev = emNode;
         found.len -= use;
         d.len -= use;
+        found.usedAs = 'open';
+        d.usedAs = 'close';
         found.node.s = found.node.s.slice(0, found.len);
         d.node.s = d.node.s.slice(use);
         if (d.len === 0) break;
