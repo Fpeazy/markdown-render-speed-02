@@ -33,6 +33,42 @@ const isPunct = (c) =>
   (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
 const isAscii = (c) => c < 128;
 
+// Recognised HTML named entities (the common ones). An extended-autolink
+// URL may contain a real entity (`&amp;`) but ends before a made-up one
+// (`&hl;`), so the URL scanner checks names against this set. Text
+// escaping, by contrast, passes ANY `&name;` through literally.
+const NAMED_ENTITIES = new Set([
+  'AElig', 'AMP', 'Aacute', 'Acirc', 'Agrave', 'Alpha', 'Aring', 'Atilde', 'Auml',
+  'Beta', 'COPY', 'Ccedil', 'Chi', 'ClockwiseContourIntegral', 'Dcaron', 'Delta',
+  'DifferentialD', 'ETH', 'Eacute', 'Ecirc', 'Egrave', 'Epsilon', 'Eta',
+  'Euml', 'Gamma', 'GT', 'HilbertSpace', 'Iacute', 'Icirc', 'Igrave', 'Iota',
+  'Iuml', 'Kappa', 'Lambda', 'LT', 'Mu', 'Ntilde', 'Nu', 'Oacute', 'Ocirc',
+  'Ograve', 'Omega', 'Omicron', 'Oslash', 'Otilde', 'Ouml', 'Phi', 'Pi', 'Prime',
+  'Psi', 'QUOT', 'REG', 'Rho', 'Sigma', 'THORN', 'Tau', 'Theta', 'Uacute',
+  'Ucirc', 'Ugrave', 'Upsilon', 'Uuml', 'Xi', 'Yacute', 'Yuml', 'Zeta', 'aacute',
+  'acirc', 'acute', 'aelig', 'agrave', 'alpha', 'amp', 'and', 'ang', 'aring',
+  'asymp', 'atilde', 'auml', 'bdquo', 'beta', 'brvbar', 'bull', 'cap', 'ccedil',
+  'cedil', 'cent', 'chi', 'circ', 'clubs', 'cong', 'copy', 'crarr', 'cup', 'curren',
+  'dArr', 'dagger', 'darr', 'deg', 'delta', 'diams', 'divide', 'eacute', 'ecirc',
+  'egrave', 'empty', 'emsp', 'ensp', 'epsilon', 'equiv', 'eta', 'eth', 'euml',
+  'euro', 'exist', 'fnof', 'forall', 'frac12', 'frac14', 'frac34', 'frasl',
+  'gamma', 'ge', 'gt', 'hArr', 'harr', 'hearts', 'hellip', 'iacute', 'icirc',
+  'iexcl', 'igrave', 'infin', 'int', 'iota', 'iquest', 'isin', 'iuml', 'kappa',
+  'lArr', 'lambda', 'lang', 'laquo', 'larr', 'lceil', 'ldquo', 'le', 'lfloor',
+  'lowast', 'loz', 'lrm', 'lsaquo', 'lsquo', 'lt', 'macr', 'mdash', 'micro',
+  'middot', 'minus', 'mu', 'nabla', 'nbsp', 'ndash', 'ne', 'ni', 'not', 'notin',
+  'nsub', 'ntilde', 'nu', 'oacute', 'ocirc', 'ograve', 'oline', 'omega', 'omicron',
+  'oplus', 'or', 'ordf', 'ordm', 'oslash', 'otilde', 'otimes', 'ouml', 'para',
+  'part', 'permil', 'perp', 'phi', 'pi', 'piv', 'plusmn', 'pound', 'prime', 'prod',
+  'prop', 'psi', 'quot', 'rArr', 'rang', 'raquo', 'rarr', 'rceil', 'rdquo', 'reg',
+  'rfloor', 'rho', 'rlm', 'rsaquo', 'rsquo', 'sbquo', 'scaron', 'sdot', 'sect',
+  'shy', 'sigma', 'sigmaf', 'sim', 'spades', 'sub', 'sube', 'sum', 'sup', 'sup1',
+  'sup2', 'sup3', 'supe', 'szlig', 'tau', 'there4', 'theta', 'thinsp', 'thorn',
+  'tilde', 'times', 'trade', 'uArr', 'uacute', 'uarr', 'ucirc', 'ugrave', 'uml',
+  'upsih', 'upsilon', 'uuml', 'weierp', 'xi', 'yacute', 'yen', 'yuml', 'zeta',
+  'zwj', 'zwnj', 'ngE', 'nges', 'npre', 'nsup', 'nsube', 'nsupe',
+]);
+
 // Whitespace per CommonMark: space, tab, LF, FF, CR.
 function isWsCh(ch) {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' || ch === '\r';
@@ -1652,7 +1688,12 @@ function scanUrl(s, i) {
       continue;
     }
     if (ch === 41) {
-      if (!paren) break;
+      if (!paren) {
+        // a `)` with no open `(` ends the URL — unless more URL text
+        // follows it, in which case it is part of the URL
+        if (j + 1 < n && s.charCodeAt(j + 1) !== 60 && !isWsCh(s[j + 1])) { j++; continue; }
+        break;
+      }
       paren = false;
       parenAt = -1;
       j++;
@@ -1660,7 +1701,15 @@ function scanUrl(s, i) {
     }
     if (ch === 38) {
       const e = entityEnd(s, j);
-      if (e > 0) { j = e; continue; }
+      if (e > 0) {
+        // a numeric entity is always real; a named one must be a
+        // recognised HTML entity, or the URL ends before the `&`
+        if (s.charCodeAt(j + 1) === 35 || NAMED_ENTITIES.has(s.slice(j + 1, e - 1))) {
+          j = e;
+          continue;
+        }
+        break;
+      }
       // an invalid entity-like sequence (&...;) ends the URL here
       let k = j + 1;
       while (k < n && (isAlnum(s.charCodeAt(k)) || s.charCodeAt(k) === 35)) k++;
