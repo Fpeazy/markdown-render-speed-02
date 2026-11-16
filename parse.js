@@ -2493,6 +2493,10 @@ function scanInline(s, refs) {
   const delims = [];
   let buf = '';
   let i = 0;
+  // Round 4: after a link whose text holds an unmatched backtick run,
+  // emphasis delimiters are suppressed until the next backtick (see
+  // hasUnmatchedBacktick). Set in tryLink when such a link forms.
+  let suppressEmphUntilTick = false;
 
   function append(nn) {
     nn.pv = tail; nn.nx = null; nn.pa = null;
@@ -2597,6 +2601,12 @@ function scanInline(s, refs) {
       open.a = false;
       return -1;
     }
+    // Round 4: a link whose text holds an unmatched backtick run
+    // suppresses emphasis after the link until the next backtick
+    // (doc-28) — but only when such a later backtick exists; with no
+    // later backtick there is no phantom span and the emphasis forms
+    // normally. Record it now that the link is known to form.
+    if (hasUnmatchedBacktick(s.slice(open.ix, closeIdx)) && s.indexOf('`', end) >= 0) suppressEmphUntilTick = true;
     // Build the link/image node, taking the nodes after '[' as children.
     const isImage = open.im === 1;
     const node = mkNode(isImage ? N_IMAGE : N_LINK, '', clean, title === null ? '' : title);
@@ -2737,6 +2747,9 @@ function scanInline(s, refs) {
       buf += '\\'; i++; continue;
     }
     if (c === 96) { // code span
+      // Round 4: a backtick ends the post-link emphasis suppression
+      // (see suppressEmphUntilTick).
+      suppressEmphUntilTick = false;
       let j = i;
       while (j < n && s.charCodeAt(j) === 96) j++;
       const len = j - i;
@@ -2748,6 +2761,23 @@ function scanInline(s, refs) {
           while (m < n && s.charCodeAt(m) === 96) m++;
           if (m - k === len) { found = k; break; }
           k = m;
+        } else if (s.charCodeAt(k) === 93) {
+          // Round 4: do not cross a ']' that closes an enclosing '['
+          // to form a link (doc-28: the single '`' before ']' in
+          // '[x ``y`]' must not pair with a later '`' — the link
+          // forms instead, and the backticks stay literal inside it).
+          // But a ']' that does NOT form a link may still be crossed
+          // by a code span (cm-342/525/537: '[not a `link](/foo`)'
+          // forms the code span across ']' because the destination
+          // is invalid, so no link forms). The check reuses
+          // bracketWillFormLink on the nearest active '[' before
+          // this code-span opener.
+          let open = null;
+          for (let d = delims.length - 1; d >= 0; d--) {
+            if (delims[d].c === 91 && delims[d].a && delims[d].ix < i) { open = delims[d]; break; }
+          }
+          if (open && bracketWillFormLink(open, open.ix + 1)) break;
+          k++;
         } else k++;
       }
       if (found >= 0) {
@@ -2769,6 +2799,10 @@ function scanInline(s, refs) {
       let j = i;
       while (j < n && s.charCodeAt(j) === c) j++;
       const len = j - i;
+      // Round 4: after a link whose text holds an unmatched backtick
+      // run, emphasis delimiters are suppressed until the next
+      // backtick (doc-28) — treat the run as literal text.
+      if (suppressEmphUntilTick) { buf += s.slice(i, j); i = j; continue; }
       // GFM: a ~~~ run (3+) is not a strikethrough delimiter at all
       if (c === 126 && len >= 3) { buf += s.slice(i, j); i = j; continue; }
       const fl = flanking(s, i, len);
@@ -2994,6 +3028,37 @@ function linkTextHasBadCodeSpan(text) {
     } else i++;
   }
   return -1;
+}
+
+// Round 4: does `text` contain a backtick run with no same-length
+// closer inside `text`? Used for the marked quirk where a link whose
+// text holds such an unmatched run suppresses emphasis after the link
+// until the next backtick (doc-28: '[x ``y`](url) __a b__ `c`' leaves
+// '__a b__' literal, while '__d e__' after the '`c`' code span forms).
+function hasUnmatchedBacktick(text) {
+  let i = 0;
+  const m = text.length;
+  while (i < m) {
+    if (text.charCodeAt(i) === 96) {
+      let j = i;
+      while (j < m && text.charCodeAt(j) === 96) j++;
+      const len = j - i;
+      let k = j, found = -1;
+      while (k < m) {
+        if (text.charCodeAt(k) === 96) {
+          let q = k;
+          while (q < m && text.charCodeAt(q) === 96) q++;
+          if (q - k === len) { found = k; break; }
+          k = q;
+        } else k++;
+      }
+      if (found < 0) return true;
+      // matched code span: skip past its closer, not just its opener
+      // (else the closer is re-read as a new unmatched opener)
+      i = found + len;
+    } else i++;
+  }
+  return false;
 }
 
 // Round 4 rescue check: whether a pure-closer same-char delimiter
