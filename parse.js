@@ -743,6 +743,11 @@ function parseBlocks(src) {
   // Cleared whenever a non-indented paragraph line is added or a new
   // paragraph starts.
   let lastParaIndented = false;
+  // True when a blank line just closed an EMPTY list item (cm-280). A
+  // second consecutive blank line then also closes the list itself, so
+  // a following list marker starts a NEW list (probe33/doc-13: '+\n\n\n+'
+  // is two <ul>s; '+\n\n+' is one). Cleared on any non-blank line.
+  let closedEmptyItem = false;
   let pendingBlank = false;
   let pendingBlankDepth = 0; // container depth at which the blank occurred
 
@@ -1093,6 +1098,31 @@ function parseBlocks(src) {
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
       } else if (leaf && leaf.t === T_CODE && leaf.fence !== '' && stack[k].t === T_ITEM && !isBlankAt(cur) && leaf.hasContent) {
+        // A list item marker at the list's level ENDS the fence and
+        // starts a new item (probe34/doc-13: the '+' line after a
+        // content-ful ```` fence is a sibling item, not code content).
+        // Plain text lines are still fence content (doc-02).
+        let lineIsListMarker = false;
+        {
+          const ch = ccur(cur);
+          if (ch === 42 || ch === 43 || ch === 45) {
+            const nx = cur.i + 1 < cur.s.length ? cur.s.charCodeAt(cur.i + 1) : -1;
+            if (nx === -1 || nx === 32 || nx === 9) lineIsListMarker = true;
+          } else if (ch >= 48 && ch <= 57) {
+            let j = cur.i;
+            while (j < cur.s.length && cur.s.charCodeAt(j) >= 48 && cur.s.charCodeAt(j) <= 57) j++;
+            if (j - cur.i >= 1 && j - cur.i <= 9 && j < cur.s.length) {
+              const d = cur.s.charCodeAt(j);
+              if (d === 46 || d === 41) {
+                const nx = j + 1 < cur.s.length ? cur.s.charCodeAt(j + 1) : -1;
+                if (nx === -1 || nx === 32 || nx === 9) lineIsListMarker = true;
+              }
+            }
+          }
+        }
+        if (lineIsListMarker) {
+          closeTo(k);
+        } else {
         // Fenced code inside a list item: once the block HAS content, a
         // non-indented line does NOT close the item — it is code content
         // (marked/doc-02: the 'function f(a, b) {' line at col 0 stays
@@ -1117,7 +1147,16 @@ function parseBlocks(src) {
         cur.i = sv.i; cur.c = sv.c; cur.p = sv.p;
         if (closes) closeTo(k);
         // else: leave the containers open; Phase C handles the line.
+        } // end else (not a list marker)
       } else {
+        // An EMPTY fence that absorbed blank lines (hasContent false,
+        // but lines non-empty) — closing it leaves a blank separator
+        // behind (probe34/doc-13: the blank between the empty fence
+        // and the next item makes the list loose).
+        if (leaf && leaf.t === T_CODE && leaf.fence !== '' && !leaf.hasContent && leaf.lines && leaf.lines.length > 0) {
+          pendingBlank = true;
+          pendingBlankDepth = 1;
+        }
         closeTo(k);
       }
     }
@@ -1142,12 +1181,22 @@ function parseBlocks(src) {
         }
       }
     }
+    // A second consecutive blank line after an empty item was closed
+    // also closes the list itself (probe33/doc-13). This check runs
+    // BEFORE the cm-280 close below, so the flag set by THIS blank
+    // line is only acted upon by the NEXT blank line.
+    if (lineBlank && closedEmptyItem && stack.length > 1 && top().t === T_LIST) {
+      const lst = stack.pop();
+      finalizeContainer(lst);
+      closedEmptyItem = false;
+    }
     // A blank line closes an EMPTY list item (cm-280: '-\n\n  foo' — the
     // foo is a separate paragraph, not item content). A non-empty item
     // stays open (its next paragraph makes the list loose).
     if (lineBlank && stack.length > 1 && top().t === T_ITEM && top().children.length === 0) {
       const it = stack.pop();
       finalizeContainer(it);
+      closedEmptyItem = true;
     }
     if (lineBlank) {
       if (leaf && leaf.t === T_CODE && leaf.fence !== '') {
@@ -1216,6 +1265,9 @@ function parseBlocks(src) {
     }
 
     // ---- Phase C: open leaf continuation ----
+    // A non-blank line clears the empty-item flag (only two CONSECUTIVE
+    // blank lines after an empty item close the list).
+    closedEmptyItem = false;
     if (leaf && leaf.t === T_CODE && leaf.fence !== '') {
       // closing fence? up to 3 spaces, same char, >= opening length, only
       // spaces after
@@ -2273,15 +2325,24 @@ function scanExtDomain(s, textStart, domStart, prefix, openUnd) {
         trimmed = true;
       } else break;
     }
-    let open = 0, close = 0;
-    for (let k = 0; k < text.length; k++) {
-      if (text.charCodeAt(k) === 40) open++;
-      else if (text.charCodeAt(k) === 41) close++;
-    }
-    while (close > open && text.endsWith(')')) {
-      text = text.slice(0, -1);
-      close--;
-      trimmed = true;
+    // (3) unbalanced closing parens: a trailing ')' is trimmed only
+    // when it has no matching '(' before it in the text. A ')' in the
+    // middle is always kept, even if it makes the total count
+    // unbalanced (doc-12:
+    // 'https://img.shields.io?q=stable&page=4)](./docs/create.md)'
+    // keeps both ')' — the first is mid-URL, the last matches the
+    // '(' before './docs'). Count unmatched '(' before the trailing
+    // ')' with a depth counter (a mid-URL ')' at depth 0 is ignored).
+    while (text.endsWith(')')) {
+      let depth = 0;
+      for (let k = 0; k < text.length - 1; k++) {
+        if (text.charCodeAt(k) === 40) depth++;
+        else if (text.charCodeAt(k) === 41 && depth > 0) depth--;
+      }
+      if (depth === 0) {
+        text = text.slice(0, -1);
+        trimmed = true;
+      } else break;
     }
     // Unclosed '(': a '(' with no matching ')' AFTER it ends the URL
     // (doc-08: 'https://sub.domain.example.io)](https://npmjs.com/heading'
