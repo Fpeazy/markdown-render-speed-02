@@ -331,7 +331,11 @@ function adv(cur, n) {
   const s = cur.s;
   while (n > 0) {
     if (cur.p > 0) {
-      if (n <= cur.p) { cur.p -= n; cur.c += n; return; }
+      // A partially consumed tab: consuming exactly the remainder must
+      // also move past the tab char (doc-14: a tab split by a list-item
+      // indent left pcur on the tab, so the fence check saw a tab instead
+      // of the backtick). advOne already does this; adv must too.
+      if (n <= cur.p) { cur.p -= n; cur.c += n; if (cur.p === 0) cur.i++; return; }
       n -= cur.p; cur.c += cur.p; cur.p = 0; cur.i++;
     } else if (cur.i >= s.length) {
       cur.c += n; return;
@@ -497,6 +501,19 @@ function expandTabs(str, startCol) {
     }
   }
   return out;
+}
+
+// Expand tabs in the LEADING whitespace of s to spaces, based on absolute
+// columns starting at startCol. Tabs after the first non-whitespace char
+// stay literal (marked quirk: 'x\tb' keeps its tab, but a leading tab in a
+// container is expanded — doc-09/13/17/29/32/40).
+function expandLeadTabs(s, startCol) {
+  let i = 0;
+  while (i < s.length && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+  if (i === 0) return s;
+  const lead = s.slice(0, i);
+  if (lead.indexOf('\t') < 0) return s;
+  return expandTabs(lead, startCol) + s.slice(i);
 }
 
 // Does the line (from cur, after up to 3 spaces) look like a table
@@ -810,15 +827,13 @@ function parseBlocks(src) {
   }
 
   // An HTML block ending at line li gets a trailing \n iff the next source
-  // line is non-blank, or it ends at EOF and the source ends with \n.
+  // line is not truly empty, or it ends at EOF and the source ends with \n.
+  // A whitespace-only next line does NOT suppress the newline (marked
+  // quirk, doc-15/19: '<!-- -->\n\t\nbar' -> '-->\n<p>bar</p>'); only a
+  // zero-length next line does.
   function htmlTrailNl(li) {
     if (li + 1 < lines.length) {
-      const nx = lines[li + 1];
-      for (let i = 0; i < nx.length; i++) {
-        const c = nx.charCodeAt(i);
-        if (c !== 32 && c !== 9) return true;
-      }
-      return false;
+      return lines[li + 1].length !== 0;
     }
     return srcEndsWithNl;
   }
@@ -883,6 +898,35 @@ function parseBlocks(src) {
   // The parent of a leaf is the deepest open container.
   function leafParent() { return top(); }
 
+  // marked quirk (doc-02/09): a list strips trailing spaces/tabs from the
+  // last line of its last item — the last paragraph's last line, recursing
+  // into a trailing blockquote or nested list, never into code/HTML. A
+  // non-last item, a middle line, a blockquote, or a top-level paragraph
+  // keeps its trailing spaces ('- foo   \n- bar' keeps 'foo   ').
+  function stripTrailOf(b) {
+    if (b.t === T_PARA) {
+      const ls = b.lines;
+      if (ls && ls.length > 0) {
+        const last = ls[ls.length - 1];
+        let e = last.length;
+        while (e > 0 && (last.charCodeAt(e - 1) === 32 || last.charCodeAt(e - 1) === 9)) e--;
+        if (e < last.length) ls[ls.length - 1] = last.slice(0, e);
+      }
+      return;
+    }
+    if (b.t === T_ITEM || b.t === T_QUOTE) {
+      const ch = b.children;
+      if (ch && ch.length > 0) stripTrailOf(ch[ch.length - 1]);
+      return;
+    }
+    if (b.t === T_LIST) {
+      const items = b.children;
+      if (items && items.length > 0) stripTrailOf(items[items.length - 1]);
+      return;
+    }
+    // code / html / table / head / hr: no text line to strip
+  }
+
   function finalizeContainer(b) {
     if (b.t === T_LIST) {
       // loose if any item (not the first) was preceded by a blank line, or
@@ -898,6 +942,7 @@ function parseBlocks(src) {
         }
       }
       b.tight = !loose;
+      if (items.length > 0) stripTrailOf(items[items.length - 1]);
     }
   }
   function closeTo(depth) {
@@ -914,16 +959,25 @@ function parseBlocks(src) {
     const cur = { s: raw, i: 0, c: 0, p: 0 };
 
     // ---- Phase A: continue open containers (outer to inner) ----
+    // bqExtra: columns stripped by blockquote markers OTHER than the
+    // innermost. For tab expansion in fenced code, marked aligns tab stops
+    // as if only the innermost '>' existed (doc-05/09/19: '> > \tX' gives
+    // 2 spaces, not 4) — so the outer markers' width is subtracted from
+    // the expansion column in Phase C.
     let k = 1;
+    let bqTotal = 0, bqLast = 0;
     while (k < stack.length) {
       const b = stack[k];
       const si = cur.i, sc = cur.c, sp = cur.p;
       if (b.t === T_QUOTE) {
+        const bc0 = cur.c;
         skipSpaces(cur, 3);
         if (ccur(cur) === 62) {
           advOne(cur);
           const ch = ccur(cur);
           if (ch === 32 || ch === 9) adv(cur, 1);
+          const w = cur.c - bc0;
+          bqTotal += w; bqLast = w;
           k++;
         } else {
           cur.i = si; cur.c = sc; cur.p = sp;
@@ -963,10 +1017,27 @@ function parseBlocks(src) {
           else break;
         }
         if (ind2 < 4) {
+          // A line starting a list marker is not a lazy continuation:
+          // it closes the open containers and starts a list (or a
+          // sibling item). Any starting number counts ('2.' after a
+          // blockquote starts <ol start="2">, doc-40) — the 'starts
+          // with 1' rule only governs interrupting a paragraph at the
+          // same level (cm-283 'Foo\n2. bar' is still one paragraph).
+          // Verify the full marker so '2 apples' still continues lazily.
           const ch2 = ccur(p2);
-          const hasList = stack.some(b => b.t === T_LIST);
-          if (hasList && (ch2 === 42 || ch2 === 43 || ch2 === 45 || (ch2 >= 48 && ch2 <= 57))) {
-            listMarkerHere = true;
+          if (ch2 === 42 || ch2 === 43 || ch2 === 45) {
+            const nx = p2.i + 1 < p2.s.length ? p2.s.charCodeAt(p2.i + 1) : -1;
+            if (nx === -1 || nx === 32 || nx === 9) listMarkerHere = true;
+          } else if (ch2 >= 48 && ch2 <= 57) {
+            let j = p2.i;
+            while (j < p2.s.length && p2.s.charCodeAt(j) >= 48 && p2.s.charCodeAt(j) <= 57) j++;
+            if (j - p2.i >= 1 && j - p2.i <= 9 && j < p2.s.length) {
+              const d = p2.s.charCodeAt(j);
+              if (d === 46 || d === 41) {
+                const nx = j + 1 < p2.s.length ? p2.s.charCodeAt(j + 1) : -1;
+                if (nx === -1 || nx === 32 || nx === 9) listMarkerHere = true;
+              }
+            }
           }
         }
       }
@@ -974,6 +1045,31 @@ function parseBlocks(src) {
         lazyLine = true;
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
+      } else if (leaf && leaf.t === T_CODE && leaf.fence !== '' && stack[k].t === T_ITEM && !isBlankAt(cur) && leaf.lines.length > 0) {
+        // Fenced code inside a list item: once the block HAS content, a
+        // non-indented line does NOT close the item — it is code content
+        // (marked/doc-02: the 'function f(a, b) {' line at col 0 stays
+        // inside the item's ```css block, and the ```inner backticks```
+        // line after it too). The containers stay open; Phase C adds the
+        // line as content (stripping up to fenceInd). An EMPTY code block
+        // does NOT absorb: a non-indented line closes it (marked/doc-38:
+        // 'branch deno html' after an empty ```bash block is a paragraph,
+        // the block stays empty). A closing fence — even at col 0 —
+        // still closes, via closeTo below (a col-0 fence closes the
+        // in-list block and opens a new top-level fence). A blockquote's
+        // '>' IS required: a line without it closes, unchanged.
+        const sv = { i: cur.i, c: cur.c, p: cur.p };
+        skipSpaces(cur, 3);
+        const fc = ccur(cur);
+        let closes = false;
+        if (fc === leaf.fence.charCodeAt(0)) {
+          let n = 0;
+          while (ccur(cur) === fc) { advOne(cur); n++; }
+          if (n >= leaf.fenceLen && isBlankAt(cur)) closes = true;
+        }
+        cur.i = sv.i; cur.c = sv.c; cur.p = sv.p;
+        if (closes) closeTo(k);
+        // else: leave the containers open; Phase C handles the line.
       } else {
         closeTo(k);
       }
@@ -986,6 +1082,19 @@ function parseBlocks(src) {
     // '>' alone is blank. With no container matched, a whitespace-only
     // line is blank.
     const lineBlank = isBlankStr(cur.s) || ((k > 1) ? (cur.i >= cur.s.length) : isBlankAt(cur));
+    // A whitespace-only line of exactly 4 columns ending in a tab is an
+    // empty table row, not a blank line (marked quirk, doc-13/26/33:
+    // '\t' after a table row adds an empty <tr>). It needs a body row
+    // already and a terminating newline (a trailing tab line with no
+    // '\n' is blank).
+    if (lineBlank && leaf && leaf.t === T_TABLE && leaf.rows.length > 0) {
+      if (wsCols(cur) === 4 && cur.s.length > 0 && cur.s.charCodeAt(cur.s.length - 1) === 9) {
+        if (li < lines.length - 1 || srcEndsWithNl) {
+          leaf.rows.push([]);
+          continue;
+        }
+      }
+    }
     // A blank line closes an EMPTY list item (cm-280: '-\n\n  foo' — the
     // foo is a separate paragraph, not item content). A non-empty item
     // stays open (its next paragraph makes the list loose).
@@ -1071,12 +1180,16 @@ function parseBlocks(src) {
         }
       }
       cur.i = save.i; cur.c = save.c; cur.p = save.p;
-      // content line: strip up to fenceInd columns
+      // content line: strip up to fenceInd columns. A tab straddling the
+      // strip boundary is consumed ENTIRELY (marked: a tab at col 0 in a
+      // fence indented 1-3 leaves 0 spaces, not a partial-tab remainder;
+      // doc-13/17). So after adv, if a partial tab remains, eat the tab.
       const avail = wsCols(cur);
       const strip = Math.min(avail, leaf.fenceInd);
       adv(cur, strip);
+      if (cur.p > 0) { cur.c += cur.p; cur.p = 0; cur.i++; }
       const codeText = rest(cur);
-      leaf.lines.push(k > 1 ? expandTabs(codeText, cur.c) : codeText);
+      leaf.lines.push(k > 1 ? expandTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
       continue;
     }
     if (leaf && leaf.t === T_CODE) {
@@ -1136,24 +1249,31 @@ function parseBlocks(src) {
           break;
         }
         if (leaf.t === T_PARA) {
-          // indented line continues the paragraph: the leading spaces are
-          // part of the paragraph text (cm-222/223)
-          leaf.lines.push(rest(cur));
+          // indented line continues the paragraph. Inside a list item the
+          // 4-column indented-code indent is stripped ('- a' + '      b'
+          // -> 'b'; '- a' + '  \t\t\tb' -> 6 spaces); inside a
+          // blockquote the leading tabs are expanded ('> a' + '> \t\tb'
+          // -> 6 spaces, no strip); at top level the raw line is kept
+          // ('a' + '    b' -> '    b'). (doc-09/13/17)
+          if (top().t === T_ITEM) {
+            const text = expandLeadTabs(rest(cur), cur.c);
+            let n = 0;
+            while (n < 4 && n < text.length && text.charCodeAt(n) === 32) n++;
+            leaf.lines.push(text.slice(n));
+          } else if (top().t === T_QUOTE) {
+            leaf.lines.push(expandLeadTabs(rest(cur), cur.c));
+          } else {
+            leaf.lines.push(rest(cur));
+          }
           lineDone = true;
           break;
         }
         if (leaf.t === T_TABLE) {
-          // a table row may be indented: strip the indent and test it
-          adv(cur, ind);
-          const text = rest(cur);
-          if (text.indexOf('|') >= 0) {
-            leaf.rows.push(splitRow(text));
-            lineDone = true;
-            break;
-          }
+          // A row indented by 4+ columns (spaces or tab) is an indented
+          // code block, not a table row (doc-13/26/33: '    c | d' and
+          // '\tc | d' end the table). End the table and re-examine the
+          // line with its indent intact so the code-block branch takes it.
           finalizeLeaf();
-          // re-run the block-start checks on this line (cursor is already
-          // past the indentation)
           continue;
         }
         break;
@@ -1363,8 +1483,10 @@ function parseBlocks(src) {
       // 9. paragraph
       if (leaf && leaf.t === T_PARA) {
         // continuation line: the leading spaces are part of the paragraph
-        // text (cm-222: " bbb" keeps its space)
-        leaf.lines.push(rest(cur));
+        // text (cm-222: " bbb" keeps its space). A leading tab inside a
+        // container is expanded by absolute column ('- a' + '  \tb' ->
+        // '  b'); tabs after content stay literal.
+        leaf.lines.push(expandLeadTabs(rest(cur), cur.c));
         lineDone = true;
         break;
       }
@@ -1559,6 +1681,18 @@ function isAsciiLetter(cc) {
 function isAlnum(cc) {
   return (cc >= 48 && cc <= 57) || isAsciiLetter(cc);
 }
+
+// 128-entry character-class tables (technique 1): one array read replaces
+// a long OR-chain in the hot autolink check. SCHEME_CHAR: letters, digits,
+// '+', '-', '.'. EMAIL_LOCAL: the GFM email local-part set (alnum plus
+// . ! # $ % & ' * + / = ? ^ _ ` { | } ~ -).
+const SCHEME_CHAR = new Uint8Array(128);
+const EMAIL_LOCAL = new Uint8Array(128);
+for (let c = 48; c <= 57; c++) { SCHEME_CHAR[c] = 1; EMAIL_LOCAL[c] = 1; }
+for (let c = 65; c <= 90; c++) { SCHEME_CHAR[c] = 1; EMAIL_LOCAL[c] = 1; }
+for (let c = 97; c <= 122; c++) { SCHEME_CHAR[c] = 1; EMAIL_LOCAL[c] = 1; }
+SCHEME_CHAR[43] = 1; SCHEME_CHAR[45] = 1; SCHEME_CHAR[46] = 1;
+for (const c of [46, 33, 35, 36, 37, 38, 39, 42, 43, 47, 61, 63, 94, 95, 96, 123, 124, 125, 126, 45]) EMAIL_LOCAL[c] = 1;
 
 function flanking(s, i, len) {
   const before = i > 0 ? s[i - 1] : '';
@@ -1992,12 +2126,18 @@ function scanExtDomain(s, textStart, domStart, prefix, openUnd) {
       if (!isAsciiLetter(s.charCodeAt(k))) return null;
     }
   }
-  // path: everything up to whitespace / control / < >
+  // path: everything up to whitespace / control / < > — but NOT for an
+  // email: an email has no path, so '?\' after the domain must not be
+  // consumed (doc-21: 'modern@cinder.example.com?\' ends at .com, and the
+  // '?' + hard-break stay outside). A scheme/www link keeps its path,
+  // including a trailing '\' (doc-37/40).
   let end = j;
-  while (end < n) {
-    const d = s.charCodeAt(end);
-    if (d === 32 || d === 9 || d === 10 || d === 60 || d === 62 || d < 32) break;
-    end++;
+  if (prefix !== 'mailto:') {
+    while (end < n) {
+      const d = s.charCodeAt(end);
+      if (d === 32 || d === 9 || d === 10 || d === 60 || d === 62 || d < 32) break;
+      end++;
+    }
   }
   if (end === j && labels === 0) return null;
   // trailing rules, in order: entity, punctuation, unbalanced parens
@@ -2107,6 +2247,40 @@ function scanInline(s, refs) {
     return false;
   }
 
+  // marked quirk: a link whose text contains a code span delimited by 2+
+  // backticks that itself contains a backtick does NOT form a link
+  // (doc-18: [empty test `` a ` b `` output][all-40] stays literal; the
+  // [all-40] then links on its own). A single-backtick span, or a 2+ span
+  // with no backtick inside, forms normally.
+  function linkTextHasBadCodeSpan(text) {
+    let i = 0;
+    const m = text.length;
+    while (i < m) {
+      if (text.charCodeAt(i) === 96) {
+        let j = i;
+        while (j < m && text.charCodeAt(j) === 96) j++;
+        const len = j - i;
+        let k = j;
+        let found = -1;
+        while (k < m) {
+          if (text.charCodeAt(k) === 96) {
+            let q = k;
+            while (q < m && text.charCodeAt(q) === 96) q++;
+            if (q - k === len) { found = k; break; }
+            k = q;
+          } else k++;
+        }
+        if (found >= 0) {
+          if (len >= 2 && text.slice(j, found).indexOf('`') >= 0) return true;
+          i = found + len;
+        } else {
+          i = j;
+        }
+      } else i++;
+    }
+    return false;
+  }
+
   // Try to form a link/image at the ']' at s[closeIdx]. Returns the index
   // to continue scanning from, or -1 when no link was formed.
   function tryLink(closeIdx) {
@@ -2149,6 +2323,14 @@ function scanInline(s, refs) {
       open.a = false; // not a link: this '[' can never open one
       return -1;
     }
+    // A 2+ backtick code span containing a backtick in the link text
+    // blocks a REFERENCE link (marked quirk, see linkTextHasBadCodeSpan;
+    // doc-18). It does NOT block an inline link (doc-05 line 1227 forms
+    // fine), so only apply when the next char is not '('.
+    if (next !== 40 && linkTextHasBadCodeSpan(s.slice(open.ix, closeIdx))) {
+      open.a = false;
+      return -1;
+    }
     const clean = cleanUrl(href);
     if (clean === null) {
       open.a = false;
@@ -2182,7 +2364,8 @@ function scanInline(s, refs) {
 
   // Does an extended autolink start at s[j]? www., a scheme:// within 32
   // chars, or an email '@' within 64 chars. Cheap: only the word after a
-  // boundary is scanned.
+  // boundary is scanned. The char tests use 128-entry lookup tables
+  // (technique 1) instead of long OR-chains: one array read per char.
   function extAutolinkAhead(j) {
     if (s.startsWith('www.', j)) return true;
     if (s.startsWith('mailto:', j) || s.startsWith('xmpp:', j)) return true;
@@ -2192,7 +2375,7 @@ function scanInline(s, refs) {
     let k = j;
     while (k < n && k - j <= 32) {
       const d = s.charCodeAt(k);
-      if (isAlnum(d) || d === 43 || d === 45 || d === 46) { k++; continue; }
+      if (d < 128 && SCHEME_CHAR[d]) { k++; continue; }
       if (d === 58 && s.startsWith('://', k)) return true;
       break;
     }
@@ -2200,10 +2383,7 @@ function scanInline(s, refs) {
     let m = j;
     while (m < n && m - j <= 64) {
       const d = s.charCodeAt(m);
-      if (isAlnum(d) || d === 46 || d === 33 || d === 35 || d === 36 || d === 37 ||
-          d === 38 || d === 39 || d === 42 || d === 43 || d === 47 || d === 61 ||
-          d === 63 || d === 94 || d === 95 || d === 96 || d === 123 || d === 124 ||
-          d === 125 || d === 126 || d === 45) { m++; continue; }
+      if (d < 128 && EMAIL_LOCAL[d]) { m++; continue; }
       if (d === 64) return true;
       break;
     }
