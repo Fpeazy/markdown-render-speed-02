@@ -499,7 +499,8 @@ function parseBlocks(text, ctx) {
         const rest = lines.slice(i).join('\n');
         const def = parseRefDef(rest, wsEnd);
         if (def) {
-          ctx.refs.set(def.label, { dest: def.dest, title: def.title });
+          // first definition wins (cm-204)
+          if (!ctx.refs.has(def.label)) ctx.refs.set(def.label, { dest: def.dest, title: def.title });
           const consumed = rest.slice(0, def.end);
           const nl = (consumed.match(/\n/g) || []).length;
           i += nl + 1;
@@ -619,14 +620,11 @@ function gatherParagraph(lines, i, ctx) {
   let isTable = false, tableAligns = null, tableHeader = null;
   while (i < lines.length) {
     const line = lines[i];
-    if (isBlankLine(line)) break;
     // ws-only last line of the text that does not end with \n is a
-    // paragraph continuation, not a blank terminator (cm-241)
-    if (/^[ \t]+$/.test(line)) {
-      // it is the last line of the whole text and text lacks trailing \n:
-      // handled by caller via ctx.endsWithNL; here treat as continuation
-      // only if it is the final line and !ctx.endsWithNL
-      if (i === lines.length - 1 && !ctx.endsWithNL) { pLines.push(line); i++; continue; }
+    // paragraph continuation, not a blank terminator (cm-241). This check
+    // must come before the blank-line break (isBlankLine catches it).
+    if (isBlankLine(line)) {
+      if (/^[ \t]+$/.test(line) && i === lines.length - 1 && !ctx.endsWithNL) { pLines.push(line); i++; continue; }
       break;
     }
     // lazy lines continue the paragraph without any block checks
@@ -727,7 +725,10 @@ function gatherQuote(lines, i, ctx) {
       j++;
       continue;
     }
-    if (isBlankLine(line)) { inner.push(''); prevKind = 'blank'; prevLazyStripped = false; j++; continue; }
+    if (isBlankLine(line)) {
+      if (fenceOpen) { inner.push(''); prevKind = 'blank'; prevLazyStripped = false; j++; continue; }
+      break; // blank line without '>' ends the blockquote (cm-242/252)
+    }
     if (fenceOpen) break; // line without > while a fence is open ends the quote
     const prev = inner.length ? inner[inner.length - 1] : null;
     if (prev !== null && prevIsParagraphLine(prev) && !interruptsParagraph(line)) {
@@ -744,7 +745,9 @@ function gatherQuote(lines, i, ctx) {
     }
     break;
   }
-  while (inner.length && isBlankLine(inner[inner.length - 1])) inner.pop();
+  // trim trailing truly-empty lines only: a whitespace-only line is a
+  // paragraph continuation (cm-241), not a blank
+  while (inner.length && inner[inner.length - 1] === '') inner.pop();
   const sub = parseBlocks(inner.join('\n'), { refs: ctx.refs, lazy, endsWithNL: false });
   return { nodes: sub.nodes, next: j };
 }
@@ -806,6 +809,8 @@ function gatherList(lines, i, ctx) {
         const lm2 = listMarker(expandTabs(lines[k], 0));
         if (sameListMarker(lm2, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; break; }
         if (indentOf(lines[k]) >= ci) {
+          // an empty item ends at a blank line (cm-280)
+          if (itemLines.every(l => isBlankLine(l))) break;
           for (let b = j; b < k; b++) itemLines.push('');
           j = k; continue;
         }
@@ -816,7 +821,10 @@ function gatherList(lines, i, ctx) {
       if (sameListMarker(lm2, ordered, delim) && indentOf(l) <= 3) break;
       const prev = itemLines.length ? itemLines[itemLines.length - 1] : null;
       if (prev !== null && prevIsParagraphLine(prev) && !interruptsParagraph(l)) {
-        itemLines.push(l);
+        // lazy line: strip 4 columns iff indent >= 4 (cm-291)
+        let il = l;
+        if (indentOf(il) >= 4) il = stripIndentCols(il, 4);
+        itemLines.push(il);
         j++;
         continue;
       }
@@ -871,8 +879,8 @@ function scanLabel(src, i) {
   }
   if (depth !== 0) return null;
   const raw = src.slice(i + 1, j);
-  if (raw.length === 0 || raw.length > 999) return null;
-  return { label: raw, end: j + 1 };
+  if (raw.length > 999) return null;
+  return { label: raw, end: j + 1 }; // empty label '' allowed: [foo][] is a collapsed reference
 }
 
 // Skip spaces/tabs/newlines (not across a blank line). Returns index or -1.
@@ -922,6 +930,7 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
   }
   // reference link: [label] / [] / shortcut
   const q2 = skipWsNoBlank(text, p);
+  let emptyLabelEnd = -1;
   if (q2 >= 0 && text[q2] === '[') {
     const lab = scanLabel(text, q2);
     if (!lab) return null;
@@ -934,14 +943,16 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
       return null; // label present but undefined -> no link (no shortcut fallback)
     }
     // empty label '[]': collapsed reference, fall through to shortcut
-    // (link text is the label, e.g. [lexer callback][])
+    // (link text is the label, e.g. [lexer callback][]); the '[]' is
+    // consumed too, so the end is the label's end, not just past ']'
+    emptyLabelEnd = lab.end;
   }
   // shortcut reference: label = link text
   const rawLabel = text.slice(opener.pos + 1, linkTextEnd);
   const key = normalizeLabel(rawLabel);
   if (refs.has(key)) {
     const ref = refs.get(key);
-    return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: pos + 1 };
+    return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: emptyLabelEnd >= 0 ? emptyLabelEnd : pos + 1 };
   }
   return null;
 }
@@ -1086,12 +1097,13 @@ function tokenizeInline(text, refs) {
       }
       buf += '`'.repeat(run); i = j; continue;
     }
-    // emphasis / strikethrough delimiters
+    // emphasis / strikethrough delimiters ('~' runs of 1-2 are
+    // strikethrough delimiters; runs of 3+ are literal text)
     if (c === '*' || c === '_' || c === '~') {
       let j = i;
       while (j < n && text[j] === c) j++;
       const run = j - i;
-      if (c === '~' && run < 2) { buf += '~'.repeat(run); i = j; continue; }
+      if (c === '~' && run >= 3) { buf += '~'.repeat(run); i = j; continue; }
       const prev = i > 0 ? text[i - 1] : undefined;
       const next = j < n ? text[j] : undefined;
       const leftFl = !isSpaceU(next) && (!isPunctU(next) || isSpaceU(prev) || isPunctU(prev));
@@ -1187,6 +1199,8 @@ function processEmphasis(nodes) {
         if (op.canOpen && op.canClose && cl.canOpen && cl.canClose) {
           if ((op.len + cl.len) % 3 === 0 && !(op.len % 3 === 0 && cl.len % 3 === 0)) continue;
         }
+        // strikethrough: '~' runs must have equal length (1 with 1, 2 with 2)
+        if (op.ch === '~' && op.len !== cl.len) continue;
         found = { oi, ci, op, cl };
         break;
       }
