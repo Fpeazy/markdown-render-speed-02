@@ -460,7 +460,7 @@ function closeContainer(P, node) {
 // content (fenced code, indented code, HTML block types 1-6), append it.
 // Otherwise close a paragraph/table, and mark that a blank line was seen
 // (for list tightness).
-function handleBlank(P, leafReachable) {
+function handleBlank(P, leafReachable, c) {
   const leaf = P.leaf;
   if (leafReachable && leaf) {
     if (leaf.t === 'fence') {
@@ -468,7 +468,10 @@ function handleBlank(P, leafReachable) {
       return;
     }
     if (leaf.t === 'code') {
-      leaf.s += '\n';
+      // a blank line inside indented code keeps its spaces beyond the
+      // 4-column code indent
+      curAdv(c, 4);
+      leaf.s += curRest(c) + '\n';
       return;
     }
     if (leaf.t === 'html' && leaf.kind <= 6) {
@@ -805,6 +808,8 @@ function htmlStart(c, canInterrupt) {
   if (NOT_BLOCK_TAG.has(name)) return { kind: 1, end: '</' + name };
   if (BLOCK_TAGS.has(name)) return { kind: 6, end: null };
   if (!canInterrupt) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
+  // type 7: any other tag, but only when the tag is complete on this line
+  if (parseHtmlTag(s, c.i) === 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   return { kind: 7, end: null };
 }
 
@@ -834,8 +839,15 @@ function setextLevel(c) {
   curSkipWs(c, 3);
   const ch = curPeek(c);
   if (ch !== 61 && ch !== 45) { c.i = saveI; c.col = saveCol; c.s = saveS; return 0; }
-  const n = onlyChar(c, ch);
+  const n = runLen(c, ch);
   if (n === 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return 0; }
+  // after the run, only spaces/tabs may follow (no internal spaces)
+  let i = c.i + n;
+  while (i < c.s.length) {
+    const cc = c.s.charCodeAt(i);
+    if (cc !== 32 && cc !== 9) { c.i = saveI; c.col = saveCol; c.s = saveS; return 0; }
+    i++;
+  }
   return ch === 61 ? 1 : 2;
 }
 
@@ -887,6 +899,7 @@ function listStart(c) {
 // colons.
 function tableDelim(c) {
   const saveI = c.i, saveCol = c.col, saveS = c.s;
+  if (curIndent(c) > 3) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   curSkipWs(c, 3);
   const rest = c.s.slice(c.i).trim();
   if (rest === '') { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
@@ -1156,7 +1169,7 @@ function processLine(P, c, leafReachable, wasBlank) {
       const sl = setextLevel(c);
       if (sl > 0) {
         const head = mkHead(sl);
-        head.s = leaf.s;
+        head.s = leaf.s.trim();
         const par = leaf._parent;
         par.ch[par.ch.indexOf(leaf)] = head;
         P.leaf = null;
@@ -1191,6 +1204,8 @@ function processLine(P, c, leafReachable, wasBlank) {
 // Parse the document into a block tree plus link reference definitions.
 function parseBlocks(src) {
   const lines = src.split('\n');
+  // a trailing newline ends the last line; it is not an extra blank line
+  if (src.endsWith('\n')) lines.pop();
   const P = {
     root: mkDoc(),
     open: [],
@@ -1210,13 +1225,36 @@ function parseBlocks(src) {
       else if (b.t === 'list') { lastMatched = k; }
       else break;
     }
+    // Lazy continuation: the open leaf is a paragraph, some containers did
+    // not match, the line is not blank, and it does not start a block that
+    // interrupts a paragraph. The line is appended to the paragraph and
+    // the containers stay open. A level-1 setext underline as a lazy line
+    // is paragraph text; in a blockquote, after an earlier lazy line, it
+    // is prefixed with 4 spaces so it can never read as an underline.
+    if (lastMatched < P.open.length - 1 && P.leaf !== null && P.leaf.t === 'para') {
+      const c2 = curOf(lines[ln]);
+      if (!curBlank(c2) && !startsInterruptingBlock(curOf(lines[ln]), true)) {
+        const leaf = P.leaf;
+        const sl = setextLevel(curOf(lines[ln]));
+        const c3 = curOf(lines[ln]);
+        expandLeadTabs(c3);
+        let lineText = curRest(c3);
+        if (sl === 1 && leaf.lazy && P.open[lastMatched + 1].t === 'quote') {
+          lineText = '    ' + lineText.replace(/^[ \t]+/, '');
+        }
+        leaf.s += '\n' + lineText;
+        leaf.lines++;
+        leaf.lazy = true;
+        continue;
+      }
+    }
     while (P.open.length - 1 > lastMatched) {
       closeContainer(P, P.open.pop());
     }
     const leafReachable = P.leaf !== null && P.leafParent === P.open[lastMatched];
     if (P.leaf !== null && !leafReachable) closeLeaf(P);
     if (curBlank(c)) {
-      handleBlank(P, leafReachable);
+      handleBlank(P, leafReachable, c);
       continue;
     }
     const wasBlank = P.pendBlank;
