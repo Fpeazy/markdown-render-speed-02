@@ -1557,29 +1557,54 @@ function parseHtmlTag(s, i) {
     }
     return 0;
   }
-  // tag
-  if (s.charCodeAt(j) === 47) j++;
+  // tag: <name (ws attr (ws = ws value)?)* ws /?> — newlines are valid
+  // whitespace inside a tag; a backslash or `)` outside quotes is not
+  let closing = false;
+  if (s.charCodeAt(j) === 47) { closing = true; j++; }
   if (j >= n || !isAlpha(s.charCodeAt(j))) return 0;
   while (j < n && (isAlnum(s.charCodeAt(j)) || s.charCodeAt(j) === 45)) j++;
-  // attributes: quoted strings, single-quoted strings, unquoted values
-  let inSingle = false, inDouble = false;
   while (j < n) {
     const ch = s.charCodeAt(j);
-    if (inDouble) {
-      if (ch === 34) inDouble = false;
-      j++;
-      continue;
-    }
-    if (inSingle) {
-      if (ch === 39) inSingle = false;
-      j++;
-      continue;
-    }
-    if (ch === 34) { inDouble = true; j++; continue; }
-    if (ch === 39) { inSingle = true; j++; continue; }
+    if (ch === 32 || ch === 9 || ch === 10 || ch === 13) { j++; continue; }
     if (ch === 62) return j + 1;
-    if (ch === 10) return 0;
+    if (closing) return 0;
+    if (ch === 47) {
+      if (j + 1 < n && s.charCodeAt(j + 1) === 62) return j + 2;
+      return 0;
+    }
+    // attribute name: letter, _ or : then alnum, _, :, . or -
+    if (!(isAlpha(ch) || ch === 95 || ch === 58)) return 0;
     j++;
+    while (j < n) {
+      const c2 = s.charCodeAt(j);
+      if (isAlnum(c2) || c2 === 95 || c2 === 58 || c2 === 46 || c2 === 45) j++;
+      else break;
+    }
+    let k = j;
+    while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9 || s.charCodeAt(k) === 10 || s.charCodeAt(k) === 13)) k++;
+    if (k < n && s.charCodeAt(k) === 61) {
+      k++;
+      while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9 || s.charCodeAt(k) === 10 || s.charCodeAt(k) === 13)) k++;
+      if (k >= n) return 0;
+      const q = s.charCodeAt(k);
+      if (q === 34 || q === 39) {
+        k++;
+        while (k < n && s.charCodeAt(k) !== q) k++;
+        if (k >= n) return 0;
+        j = k + 1;
+      } else {
+        // unquoted value: no whitespace, ", ', =, <, >, backtick
+        if (q === 32 || q === 9 || q === 10 || q === 13 || q === 34 || q === 39 || q === 61 || q === 60 || q === 62 || q === 96) return 0;
+        while (k < n) {
+          const c3 = s.charCodeAt(k);
+          if (c3 === 32 || c3 === 9 || c3 === 10 || c3 === 13 || c3 === 34 || c3 === 39 || c3 === 61 || c3 === 60 || c3 === 62 || c3 === 96) break;
+          k++;
+        }
+        j = k;
+      }
+    } else {
+      j = k;
+    }
   }
   return 0;
 }
