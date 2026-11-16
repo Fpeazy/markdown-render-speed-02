@@ -1204,6 +1204,11 @@ function parseBlocks(src) {
         // fence indent (cm-129: "  " stays "  ")
         const strip = Math.min(wsCols(cur), leaf.fenceInd);
         adv(cur, strip);
+        // BACKTICK fences only (tilde fences strip nothing): a tab
+        // straddling the strip boundary is consumed ENTIRELY
+        // (probe35/doc-14: a '\t' line in a fence indented 1 leaves an
+        // empty line, not 3 spaces). Same rule as Phase C.
+        if (leaf.fence.charCodeAt(0) !== 126 && cur.p > 0) { cur.c += cur.p; cur.p = 0; cur.i++; }
         leaf.lines.push(rest(cur));
       } else if (leaf && leaf.t === T_CODE) {
         // indented code: a whitespace-only line keeps the spaces beyond
@@ -1312,7 +1317,10 @@ function parseBlocks(src) {
       if (wsCols(cur) >= 4) {
         adv(cur, 4);
         const codeText = rest(cur);
-        leaf.lines.push(k > 1 ? expandTabs(codeText, cur.c) : codeText);
+        // Only leading tabs are expanded (a tab after other content,
+        // e.g. '> \tindented' inside the block, stays literal —
+        // doc-14; same rule as fenced code above).
+        leaf.lines.push(k > 1 ? expandLeadTabs(codeText, cur.c) : codeText);
         continue;
       }
       finalizeLeaf();
