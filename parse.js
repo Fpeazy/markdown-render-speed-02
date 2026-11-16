@@ -2453,15 +2453,14 @@ function scanInline(s, refs) {
       return -1;
     }
     // A 2+ backtick code span containing a backtick in the link text
-    // blocks the link (marked quirk, see linkTextHasBadCodeSpan;
-    // doc-18). A reference link is blocked by any such span; an inline
-    // link is blocked only when something follows the span before ']'
-    // ('[a `` b ` c ``](url)' forms — doc-05 line 1227 — but
-    // '[a `` b ` c `` d](url)' and '[a `` b ` c ``_](url)' do not).
+    // blocks the link only when something follows the span before ']'
+    // (probe31/doc-10: '[a `` b ` c ``][29]' forms, but
+    // '[a `` b ` c `` d][29]' does not; the same holds for inline links:
+    // '[a `` b ` c ``](url)' forms, '[a `` b ` c `` d](url)' does not).
     {
       const linkText = s.slice(open.ix, closeIdx);
       const badEnd = linkTextHasBadCodeSpan(linkText);
-      if (badEnd >= 0 && (next !== 40 || badEnd < linkText.length)) {
+      if (badEnd >= 0 && badEnd < linkText.length) {
         open.a = false;
           return -1;
       }
@@ -2587,7 +2586,7 @@ function scanInline(s, refs) {
     if (href === null) return false;
     const linkText = s.slice(open.ix, closeIdx);
     const badEnd = linkTextHasBadCodeSpan(linkText);
-    if (badEnd >= 0 && (next !== 40 || badEnd < linkText.length)) return false;
+    if (badEnd >= 0 && badEnd < linkText.length) return false;
     if (cleanUrl(href) === null) return false;
     // a link cannot contain a (markdown) link
     if (open.im !== 1 && containsLink(open.nd.nx)) return false;
@@ -2945,6 +2944,7 @@ function processEmphasis(delims) {
         }
         for (let attempt = 0; attempt < 2; attempt++) {
           blocked = false;
+          let blockedByStar = false;
           for (let xi = oi + 1; xi < di; xi++) {
             const x = delims[xi];
             if (x.c !== d.c) continue;
@@ -2962,19 +2962,27 @@ function processEmphasis(delims) {
             // SAME single delimiter (ul === use === 1), the opener
             // has length >= 2, and the closer is exactly consumed
             // ('**public *so*other*' literal). A same-length strong
-            // inner never blocks a strong outer
-            // ('**a **b**c d**' forms).
+            // inner blocks a strong outer ONLY when a pure-closer
+            // single '*' sits between the inner closer and the outer
+            // closer ('**a **b**c* d**' forms an em, not a strong;
+            // '**a **b**c d**' with no such '*' forms the strong).
             let blockThis = false;
             if (x.ul > use && d.n === use) blockThis = true;
             else if (x.ul < use && o.n >= 2 && (d.n === use || o.n > use)) blockThis = true;
             else if (x.ul === 1 && use === 1 && o.n >= 2 && d.n === use) blockThis = true;
+            else if (x.ul === 2 && use === 2) {
+              for (let yi = xi + 1; yi < di; yi++) {
+                const y = delims[yi];
+                if (y.c === 42 && y.n === 1 && y.l && !y.o) { blockThis = true; blockedByStar = true; break; }
+              }
+            }
             if (!blockThis) continue;
             x.bl = true;
             blocked = true;
             break;
           }
           if (!blocked) break;
-          if (use === 2 && o.n >= 3 && d.n >= 3) { use = 1; continue; }
+          if (use === 2 && (blockedByStar || (o.n >= 3 && d.n >= 3))) { use = 1; continue; }
           break;
         }
       }
