@@ -2494,9 +2494,18 @@ function scanInline(s, refs) {
   let buf = '';
   let i = 0;
   // Round 4: after a link whose text holds an unmatched backtick run,
-  // emphasis delimiters are suppressed until the next backtick (see
-  // hasUnmatchedBacktick). Set in tryLink when such a link forms.
+  // emphasis delimiters are suppressed when a backtick follows them
+  // (doc-28/09/35: '__a b__' before '`c`' is literal, but '__d e__'
+  // with no backtick after it forms; '_issue table_' before '``' is
+  // literal). Set in tryLink when such a link forms; cleared on '['
+  // (emphasis inside a link's own text is not suppressed, doc-35).
   let suppressEmphUntilTick = false;
+  const lastTick = s.lastIndexOf('`');
+  // Round 4: bracket depth — emphasis inside a link's own text is not
+  // suppressed by an outer unmatched-backtick link (doc-35: '*fast*'
+  // inside '[default run*fast*](...)' forms). Track '[' / ']' so the
+  // suppression applies only at depth 0.
+  let bracketDepth = 0;
 
   function append(nn) {
     nn.pv = tail; nn.nx = null; nn.pa = null;
@@ -2696,7 +2705,19 @@ function scanInline(s, refs) {
             m = q;
           } else m++;
         }
-        if (found >= 0) { k = found + len; continue; }
+        if (found >= 0) {
+          // Round 4: a len>=2 backtick span whose content (to its
+          // closer) holds another backtick is a "bad" span — it does
+          // NOT protect a ']' inside it (doc-09/35: the '``' in
+          // '[docs each ``url`]' pairs with a later '``', but the
+          // span's content holds the single '`', so the ']' still
+          // closes the link). Do not skip past it; let the scan
+          // find the ']'. A len-1 span, or a len>=2 span with no
+          // backtick inside, is a real code span that protects ']'
+          // (cm-342: '`link](/foo`' has no backtick inside).
+          if (len >= 2 && s.slice(j, found).indexOf('`') >= 0) { k++; continue; }
+          k = found + len; continue;
+        }
       }
       k++;
     }
@@ -2747,9 +2768,6 @@ function scanInline(s, refs) {
       buf += '\\'; i++; continue;
     }
     if (c === 96) { // code span
-      // Round 4: a backtick ends the post-link emphasis suppression
-      // (see suppressEmphUntilTick).
-      suppressEmphUntilTick = false;
       let j = i;
       while (j < n && s.charCodeAt(j) === 96) j++;
       const len = j - i;
@@ -2800,9 +2818,12 @@ function scanInline(s, refs) {
       while (j < n && s.charCodeAt(j) === c) j++;
       const len = j - i;
       // Round 4: after a link whose text holds an unmatched backtick
-      // run, emphasis delimiters are suppressed until the next
-      // backtick (doc-28) — treat the run as literal text.
-      if (suppressEmphUntilTick) { buf += s.slice(i, j); i = j; continue; }
+      // run, an emphasis run is suppressed iff a backtick follows it
+      // (doc-28/09/35) — treat the run as literal text. With no
+      // backtick after it, the emphasis forms normally. Only at
+      // bracket depth 0 (emphasis inside a link's own text is the
+      // link's content, not suppressed).
+      if (suppressEmphUntilTick && bracketDepth === 0 && j <= lastTick) { buf += s.slice(i, j); i = j; continue; }
       // GFM: a ~~~ run (3+) is not a strikethrough delimiter at all
       if (c === 126 && len >= 3) { buf += s.slice(i, j); i = j; continue; }
       const fl = flanking(s, i, len);
@@ -2823,6 +2844,7 @@ function scanInline(s, refs) {
       continue;
     }
     if (c === 91) { // [
+      bracketDepth++;
       flushText();
       const node = append(mkNode(N_TEXT, '[', '', ''));
       delims.push(mkDelim(91, 1, false, false, node, i + 1, 0));
@@ -2831,6 +2853,7 @@ function scanInline(s, refs) {
     }
     if (c === 33) { // !
       if (i + 1 < n && s.charCodeAt(i + 1) === 91) {
+        bracketDepth++;
         flushText();
         const node = append(mkNode(N_TEXT, '![', '', ''));
         delims.push(mkDelim(91, 1, false, false, node, i + 2, 1));
@@ -2840,6 +2863,7 @@ function scanInline(s, refs) {
       buf += '!'; i++; continue;
     }
     if (c === 93) { // ]
+      if (bracketDepth > 0) bracketDepth--;
       flushText();
       const end = tryLink(i);
       if (end >= 0) { i = end; continue; }
@@ -3039,12 +3063,15 @@ function hasUnmatchedBacktick(text) {
   let i = 0;
   const m = text.length;
   while (i < m) {
+    // an escaped backtick is literal text, not a code-span delimiter
+    if (text.charCodeAt(i) === 92 && i + 1 < m && text.charCodeAt(i + 1) === 96) { i += 2; continue; }
     if (text.charCodeAt(i) === 96) {
       let j = i;
       while (j < m && text.charCodeAt(j) === 96) j++;
       const len = j - i;
       let k = j, found = -1;
       while (k < m) {
+        if (text.charCodeAt(k) === 92 && k + 1 < m && text.charCodeAt(k + 1) === 96) { k += 2; continue; }
         if (text.charCodeAt(k) === 96) {
           let q = k;
           while (q < m && text.charCodeAt(q) === 96) q++;
