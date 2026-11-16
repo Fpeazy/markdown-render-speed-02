@@ -1292,16 +1292,21 @@ function parseBlocks(src) {
       // TILDE fence: marked strips NOTHING from content lines — spaces
       // and tabs are all kept literal (probe25: ' ~~~' + ' X' keeps
       // ' X'; probe22/23: tab runs are kept too).
-      // BACKTICK fence: strip up to fenceInd columns; a tab straddling
-      // the strip boundary is consumed ENTIRELY (a tab at col 0 in a
-      // fence indented 1-3 leaves 0 spaces, not a partial-tab remainder;
-      // doc-13/17, doc-38). So after adv, if a partial tab remains, eat
-      // the tab.
+      // BACKTICK fence: strip up to fenceInd leading whitespace
+      // CHARACTERS — a tab counts as ONE character, not its column
+      // width (probe37/doc-18: fenceInd=2, '\t four' strips the tab
+      // AND the space, leaving 'four'; '\t  four' strips the tab and
+      // one space, leaving ' four'). This replaces the column-based
+      // adv() strip (which left a partial tab and a leftover space).
       if (leaf.fence.charCodeAt(0) !== 126) {
-        const avail = wsCols(cur);
-        const strip = Math.min(avail, leaf.fenceInd);
-        adv(cur, strip);
-        if (cur.p > 0) { cur.c += cur.p; cur.p = 0; cur.i++; }
+        let stripChars = leaf.fenceInd;
+        while (stripChars > 0 && cur.i < cur.s.length) {
+          const ch = cur.s.charCodeAt(cur.i);
+          if (ch === 32) { cur.i++; cur.c++; stripChars--; }
+          else if (ch === 9) { cur.c += 4 - (cur.c & 3); cur.i++; stripChars--; }
+          else break;
+        }
+        cur.p = 0;
       }
       const codeText = rest(cur);
       // Only leading tabs are expanded (a tab after other content, e.g.
