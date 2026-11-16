@@ -10,9 +10,11 @@
 // Whether an unclosed inline <a> tag has been seen (marked's inline
 // tokenizer state): while set, EXTENDED autolinks (www./email/scheme)
 // are suppressed — a link cannot contain a link. Markdown links and
-// <...> autolinks are NOT suppressed. Set by an inline <a> open tag,
-// cleared by an inline </a>. Persists across paragraphs within one
-// document; reset per parse() call. HTML blocks do not touch it.
+// <...> autolinks are NOT suppressed. Set by an inline <a> open tag
+// whose HTML contains a literal space ('<a href="x">', '<a />'),
+// cleared by an inline '</a>' exactly. Persists across paragraphs
+// within one document; reset per parse() call. HTML blocks do not
+// touch it.
 let inLink = false;
 
 export function parse(markdown) {
@@ -1041,7 +1043,24 @@ function parseBlocks(src) {
           }
         }
       }
-      if (leaf && leaf.t === T_PARA && !isBlankAt(cur) && !startsInterrupt(cur) && !listMarkerHere) {
+      // A line starting with 3+ backticks whose info contains a backtick
+      // is not a valid fence, but it still does NOT lazily continue a
+      // list item's paragraph (marked/doc-06: '- item' + '```inner
+      // backticks```' ends the list; the line becomes a top-level
+      // paragraph with a code span). At top level the same line DOES
+      // lazily continue ('para' + '```inner backticks```' is one
+      // paragraph), so this only applies inside a list item. (A valid
+      // fence opener still opens a fence inside the item; a tilde
+      // fence line is unaffected — tilde info may contain tildes.)
+      let badBacktickFence = false;
+      if (stack[k].t === T_ITEM) {
+        let j = cur.i;
+        while (j < cur.s.length && (cur.s.charCodeAt(j) === 32 || cur.s.charCodeAt(j) === 9)) j++;
+        let n = 0;
+        while (j < cur.s.length && cur.s.charCodeAt(j) === 96) { n++; j++; }
+        if (n >= 3 && cur.s.slice(j).indexOf('`') >= 0) badBacktickFence = true;
+      }
+      if (leaf && leaf.t === T_PARA && !isBlankAt(cur) && !startsInterrupt(cur) && !listMarkerHere && !badBacktickFence) {
         lazyLine = true;
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
@@ -1912,7 +1931,9 @@ function parseHtmlTag(s, i) {
     const d = s.charCodeAt(k);
     if (d === 32 || d === 9 || d === 10) { k++; continue; }
     if (d === 62) return { html: s.slice(i, k + 1), end: k + 1, name, closing };
-    if (d === 47 && k + 1 < n && s.charCodeAt(k + 1) === 62) {
+    // a self-closing '/>' is opening-only: '</a/>' is not a tag at all
+    // (marked: '&lt;/a/&gt;'), so a closing tag must not take this branch
+    if (d === 47 && !closing && k + 1 < n && s.charCodeAt(k + 1) === 62) {
       return { html: s.slice(i, k + 2), end: k + 2, name, closing };
     }
     // a closing tag takes no attributes (cm-624: </a href="foo">)
@@ -2587,11 +2608,18 @@ function scanInline(s, refs) {
       }
       const tag = parseHtmlTag(s, i);
       if (tag) {
-        // an inline <a> open tag suppresses extended autolinks until an
-        // inline </a> (doc-03); a self-closing <a/> does not open a link
+        // An inline <a> open tag suppresses extended autolinks until an
+        // inline </a> (doc-03/06). Marked's rule is about a literal
+        // SPACE in the tag: an opening <a> tag sets inLink iff its HTML
+        // contains a space ('<a href="x">', '<a />', '<a >', '<a/ >'
+        // all suppress; bare '<a>', self-closing '<a/>', and
+        // '<a\thref="x">' (tab, not space) do not). A closing tag
+        // clears inLink only when it is exactly '</a>' ('</a >' and
+        // '</a/>' do not clear).
         if (tag.name === 'a') {
-          if (tag.closing) inLink = false;
-          else if (!tag.html.endsWith('/>')) inLink = true;
+          if (tag.closing) {
+            if (tag.html.toLowerCase() === '</a>') inLink = false;
+          } else if (tag.html.indexOf(' ') >= 0) inLink = true;
         }
         flushText();
         append(mkNode(N_HTML, tag.html, '', ''));
