@@ -996,7 +996,9 @@ function startsInterruptingBlock(c, inPara) {
   const q = mkQuote();
   if (matchQuote(c, q)) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
   const ls = listStart(c);
-  if (ls !== null) {
+  // an empty list item (no content on its line) cannot interrupt a
+  // paragraph, and an ordered item only interrupts when it starts with 1
+  if (ls !== null && ls.contentCol >= 0) {
     if (!ls.ordered || ls.start === 1) { c.i = saveI; c.col = saveCol; c.s = saveS; return true; }
   }
   c.i = saveI; c.col = saveCol; c.s = saveS;
@@ -1281,7 +1283,18 @@ function parseBlocks(src) {
       // lazy text is the content past them, and a blockquote marker that
       // only re-enters an already-open container does not interrupt
       const cc = { s: c.s, i: c.i, col: c.col };
-      if (!curBlank(cc) && !startsInterruptingBlock(cc, true)) {
+      // a line that starts a list item while an open list is matched is
+      // a new item (same list, or a new list when the delimiter differs),
+      // not a lazy continuation — even when the item is empty or (for an
+      // ordered list) does not start with 1
+      let continuesList = false;
+      const ls0 = listStart({ s: cc.s, i: cc.i, col: cc.col });
+      if (ls0 !== null) {
+        for (let k = lastMatched; k >= 1; k--) {
+          if (P.open[k].t === 'list') { continuesList = true; break; }
+        }
+      }
+      if (!curBlank(cc) && !continuesList && !startsInterruptingBlock(cc, true)) {
         const leaf = P.leaf;
         const sl = setextLevel({ s: cc.s, i: cc.i, col: cc.col });
         const c3 = { s: c.s, i: c.i, col: c.col };
