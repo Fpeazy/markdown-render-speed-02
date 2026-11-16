@@ -1541,8 +1541,10 @@ function parseHtmlTag(s, i) {
   const n = s.length;
   if (i + 1 >= n) return 0;
   let j = i + 1;
-  // comment
+  // comment: <!--> and <!---> are complete (abruptly closed) comments
   if (s.startsWith('!--', j)) {
+    if (s.charCodeAt(j + 3) === 62) return j + 4;
+    if (s.charCodeAt(j + 3) === 45 && s.charCodeAt(j + 4) === 62) return j + 5;
     const e = s.indexOf('-->', j + 3);
     if (e < 0) return 0;
     return e + 3;
@@ -1573,15 +1575,19 @@ function parseHtmlTag(s, i) {
   if (s.charCodeAt(j) === 47) { closing = true; j++; }
   if (j >= n || !isAlpha(s.charCodeAt(j))) return 0;
   while (j < n && (isAlnum(s.charCodeAt(j)) || s.charCodeAt(j) === 45)) j++;
+  // each attribute must be preceded by whitespace: `<m:abc>` and
+  // `<a href='bar'title=title>` are not tags
+  let needWs = true;
   while (j < n) {
     const ch = s.charCodeAt(j);
-    if (ch === 32 || ch === 9 || ch === 10 || ch === 13) { j++; continue; }
+    if (ch === 32 || ch === 9 || ch === 10 || ch === 13) { j++; needWs = false; continue; }
     if (ch === 62) return j + 1;
     if (closing) return 0;
     if (ch === 47) {
       if (j + 1 < n && s.charCodeAt(j + 1) === 62) return j + 2;
       return 0;
     }
+    if (needWs) return 0;
     // attribute name: letter, _ or : then alnum, _, :, . or -
     if (!(isAlpha(ch) || ch === 95 || ch === 58)) return 0;
     j++;
@@ -1615,6 +1621,7 @@ function parseHtmlTag(s, i) {
     } else {
       j = k;
     }
+    needWs = true;
   }
   return 0;
 }
@@ -1725,7 +1732,7 @@ function matchEmail(s, i) {
 // character before i in the source ('' at the start). Returns
 // { text, href, end } or null.
 function matchExtAutolink(s, i, prev) {
-  if (prev !== '' && !isWsCh(prev) && prev !== '*' && prev !== '_' && prev !== '~' && prev !== '(') {
+  if (prev !== '' && !isWsCh(prev) && prev !== '*' && prev !== '_' && prev !== '~' && prev !== '(' && prev !== '<') {
     return null;
   }
   const n = s.length;
