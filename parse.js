@@ -71,20 +71,10 @@ function isPunct(c) { return c !== undefined && PUNCT.indexOf(c) >= 0; }
 function isAlphaNum(c) { return c !== undefined && /[A-Za-z0-9]/.test(c); }
 function isBlankLine(s) { return /^[ \t]*$/.test(s); }
 
-// Escape text content: & < > (entity-aware: leave valid &name; / &#..; alone).
+// Escape text content: escape ALL of & < > " ' (marked's escape).
+// Entity references are separate nodes and never reach this function.
 function escapeText(s) {
-  let out = '', i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === '&') {
-      const m = /^&(?:#\d{1,7}|#x[0-9a-fA-F]{1,6}|#X[0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/.exec(s.slice(i, i + 40));
-      if (m) { out += m[0]; i += m[0].length; continue; }
-      out += '&amp;'; i++;
-    } else if (c === '<') { out += '&lt;'; i++; }
-    else if (c === '>') { out += '&gt;'; i++; }
-    else { out += c; i++; }
-  }
-  return out;
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 // Escape for attribute values (href/title/alt): escape & " < > but keep valid entities.
 function escapeAttr(s) {
@@ -187,27 +177,16 @@ function stripIndentChars(line, n) {
 }
 
 // ---------- URLs ----------
-// Clean a URL for use in href/src: encode spaces/control, reject dangerous
-// protocols (javascript:, vbscript:, data: except image data? marked rejects
-// data: for links; for images data: is allowed only when it starts with
-// data:image/ — here we follow marked: data: allowed for images only).
+// Clean a URL for use in href/src: reject dangerous protocols (checked on
+// the entity-decoded form), then percent-encode with encodeURI.
 function cleanUrl(url, isImage) {
-  let u = url.replace(/[\x00-\x20\x7F]+/g, (m) => encodeURI(m));
-  // encodeURI leaves some chars; encode spaces etc. already handled.
-  u = u.replace(/%/g, (m, off, s) => {
-    // keep valid %XX sequences, encode stray %
-    const h = s.slice(off + 1, off + 3);
-    return /^[0-9a-fA-F]{2}$/.test(h) ? '%' : '%25';
-  });
-  const lower = u.replace(/&[^;]+;/g, '').toLowerCase().trim();
-  // decode entities for the protocol check
-  const dec = unescapeText(u).toLowerCase().replace(/[\x00-\x20]+/g, '');
+  const dec = unescapeText(url).toLowerCase().replace(/[\x00-\x20]+/g, '');
   if (/^javascript:/.test(dec) || /^vbscript:/.test(dec)) return null;
   if (/^data:/.test(dec)) {
     if (!isImage) return null;
     if (!/^data:image\//.test(dec)) return null;
   }
-  return u;
+  try { return encodeURI(url); } catch { return null; }
 }
 
 // ---------- link reference definitions ----------
@@ -255,7 +234,7 @@ function parseTitle(src, i) {
     const c = src[j];
     if (c === '\\' && j + 1 < src.length && isPunct(src[j + 1])) { j += 2; continue; }
     if (c === close) {
-      return { title: unescapeText(src.slice(i + 1, j)), end: j + 1 };
+      return { title: unescapeBackslash(src.slice(i + 1, j)), end: j + 1 };
     }
     if (c === '\n') {
       // blank line inside title -> fail
@@ -581,6 +560,9 @@ function parseBlocks(text, ctx) {
       continue;
     }
 
+    // thematic break (before list: '- - -' / '* * *' is an hr, not a list)
+    if (isHr(line)) { markBlock(); nodes.push({ t: 'hr' }); i++; continue; }
+
     // blockquote
     if (/^ {0,3}>/.test(line)) {
       const res = gatherQuote(lines, i, ctx);
@@ -599,9 +581,6 @@ function parseBlocks(text, ctx) {
       i = res.next;
       continue;
     }
-
-    // thematic break
-    if (isHr(line)) { markBlock(); nodes.push({ t: 'hr' }); i++; continue; }
 
     // paragraph (handles setext, table, refdef interruption)
     {
@@ -676,16 +655,15 @@ function gatherParagraph(lines, i, ctx) {
 // Strip one blockquote marker (<=3 cols indent + '>' + one optional space/tab).
 // Returns the inner line or null.
 function stripQuoteMarker(line) {
-  let i = 0, col = 0;
-  while (i < line.length && (line[i] === ' ' || line[i] === '\t') && col < 3) {
-    if (line[i] === ' ') col++;
-    else col += 4 - (col % 4);
-    i++;
-  }
-  if (line[i] !== '>') return null;
+  // marked expands tabs while stripping container markers, so expand the
+  // whole line first (absolute columns), then strip '>' + one space.
+  const ex = expandTabs(line, 0);
+  let i = 0;
+  while (i < ex.length && ex[i] === ' ' && i < 3) i++;
+  if (ex[i] !== '>') return null;
   i++;
-  if (line[i] === ' ' || line[i] === '\t') i++;
-  return line.slice(i);
+  if (ex[i] === ' ') i++;
+  return ex.slice(i);
 }
 // Strip quote/list markers recursively (for prev-line leaf checks).
 function stripContainerMarkers(s) {
@@ -729,7 +707,7 @@ function gatherQuote(lines, i, ctx) {
     const prev = inner.length ? inner[inner.length - 1] : null;
     if (prev !== null && prevIsParagraphLine(prev) && !interruptsParagraph(line)) {
       const idx = inner.length;
-      let il = line;
+      let il = expandTabs(line, 0);
       if (indentOf(il) >= 4) il = stripIndentCols(il, 4);
       inner.push(il);
       lazy.add(idx);
@@ -764,7 +742,7 @@ function sameListMarker(lm, ordered, delim) {
 }
 
 function gatherList(lines, i, ctx) {
-  const first = listMarker(lines[i]);
+  const first = listMarker(expandTabs(lines[i], 0));
   const ordered = first.ordered;
   const delim = ordered ? first.delim : first.bullet;
   const items = [];
@@ -775,23 +753,23 @@ function gatherList(lines, i, ctx) {
       let k = j;
       while (k < lines.length && isBlankLine(lines[k])) k++;
       if (k < lines.length) {
-        const lm = listMarker(lines[k]);
+        const lm = listMarker(expandTabs(lines[k], 0));
         if (sameListMarker(lm, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; continue; }
       }
       break;
     }
-    const lm = listMarker(lines[j]);
+    const lm = listMarker(expandTabs(lines[j], 0));
     if (!sameListMarker(lm, ordered, delim) || indentOf(lines[j]) > 3) break;
     const ci = lm.contentIndent;
-    const itemLines = [stripListMarker(lines[j], lm)];
+    const itemLines = [stripListMarker(expandTabs(lines[j], 0), lm)];
     j++;
     while (j < lines.length) {
-      const l = lines[j];
+      const l = expandTabs(lines[j], 0);
       if (isBlankLine(l)) {
         let k = j;
         while (k < lines.length && isBlankLine(lines[k])) k++;
         if (k >= lines.length) { j = k; break; }
-        const lm2 = listMarker(lines[k]);
+        const lm2 = listMarker(expandTabs(lines[k], 0));
         if (sameListMarker(lm2, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; break; }
         if (indentOf(lines[k]) >= ci) {
           for (let b = j; b < k; b++) itemLines.push('');
@@ -813,7 +791,7 @@ function gatherList(lines, i, ctx) {
     while (itemLines.length && isBlankLine(itemLines[itemLines.length - 1])) itemLines.pop();
     items.push(itemLines);
     if (j < lines.length && !isBlankLine(lines[j])) {
-      const lm3 = listMarker(lines[j]);
+      const lm3 = listMarker(expandTabs(lines[j], 0));
       if (!sameListMarker(lm3, ordered, delim) || indentOf(lines[j]) > 3) break;
     }
   }
@@ -1033,11 +1011,17 @@ function tokenizeInline(text, refs) {
       if (i + 1 < n && isPunct(text[i + 1])) { buf += text[i + 1]; i += 2; continue; }
       buf += c; i++; continue;
     }
-    // entity
+    // entity: numeric -> decode to a character; named (&name;) -> pass
+    // through unchanged as an entity node; anything else -> literal '&'.
     if (c === '&') {
-      const d = decodeEntityAt(text, i);
-      if (d) { buf += d[0]; i += d[1]; continue; }
-      buf += c; i++; continue;
+      const num = /^#(?:\d{1,7}|[xX][0-9a-fA-F]{1,6});/.exec(text.slice(i + 1, i + 40));
+      if (num) {
+        const d = decodeEntityAt(text, i);
+        if (d) { buf += d[0]; i += d[1]; continue; }
+      }
+      const nm = /^([A-Za-z][A-Za-z0-9]{0,31});/.exec(text.slice(i + 1, i + 40));
+      if (nm) { flush(); nodes.push({ t: 'entity', s: '&' + nm[1] + ';' }); i += nm[0].length + 1; continue; }
+      buf += '&'; i++; continue;
     }
     // code span
     if (c === '`') {
@@ -1186,6 +1170,7 @@ function plainText(nodes) {
   for (const nd of nodes) {
     switch (nd.t) {
       case 'text': out += nd.s; break;
+      case 'entity': out += nd.s; break;
       case 'delim': out += nd.ch.repeat(nd.len); break;
       case 'code': out += nd.s; break;
       case 'open': out += nd.kind === 'image' ? '![' : '['; break;
@@ -1203,6 +1188,7 @@ function renderInline(nodes) {
   for (const nd of nodes) {
     switch (nd.t) {
       case 'text': out += escapeText(nd.s); break;
+      case 'entity': out += nd.s; break;
       case 'delim': out += escapeText(nd.ch.repeat(nd.len)); break;
       case 'code': out += '<code>' + escapeText(nd.s) + '</code>'; break;
       case 'html': out += nd.s; break;
@@ -1252,7 +1238,7 @@ function renderListItem(itemNodes, tight, ctx) {
     if (nd.t === 'p') parts.push(parseInline(nd.text, ctx.refs));
     else parts.push(renderBlocks([nd], ctx));
   }
-  return parts.join('\n');
+  return parts.join('');
 }
 
 function renderBlocks(nodes, ctx) {
@@ -1268,7 +1254,7 @@ function renderBlocks(nodes, ctx) {
       case 'fence': {
         let lang = '';
         const info = nd.info.trim();
-        if (info) lang = escapeAttr(unescapeText(info.split(/\s+/)[0]));
+        if (info) lang = escapeAttr(unescapeBackslash(info.split(/\s+/)[0]));
         out += '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + escapeText(nd.text) + (nd.text ? '\n' : '') + '</code></pre>\n';
         break;
       }
