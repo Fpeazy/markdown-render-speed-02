@@ -1354,6 +1354,8 @@ function parseBlocks(src) {
       // '> \tindented' inside a fence, stays literal — doc-08). The
       // expansion column uses the blockquote-only correction (outer '>'
       // markers subtracted); the list-item indent is NOT subtracted here.
+      // (The generalised correction was tried and regressed the count
+      // 710/720 -> 686/720; it is wrong for fenced-code content.)
       leaf.lines.push(k > 1 ? expandLeadTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
       leaf.hasContent = true;
       continue;
