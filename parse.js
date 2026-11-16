@@ -1589,6 +1589,10 @@ function tryListItem(cur, baseCol, leaf, stack, parent, addChild, finalizeLeaf, 
   }
   const empty = j >= s.length;
   if (paraOpen && empty) return null;
+  // A table body row wins over an EMPTY list marker (doc-07: a lone '*'
+  // after a table is a single-cell row, not a list item). A non-empty
+  // list item ends the table instead (see the finalize below).
+  if (leaf && leaf.t === T_TABLE && empty) return null;
   let contentIndent;
   if (empty) {
     contentIndent = markEndCol + 1;
@@ -1615,7 +1619,11 @@ function tryListItem(cur, baseCol, leaf, stack, parent, addChild, finalizeLeaf, 
     }
   }
   if (!list) {
-    if (paraOpen) finalizeLeaf();
+    // A list item ends an open paragraph OR an open table: finalize the
+    // leaf first, or the item's content would land in both (doc-07:
+    // '- item' after a table gave a '<td>item</td>' row AND an empty
+    // '<li></li>'). finalizeLeaf() just nulls the leaf for a table.
+    if (paraOpen || (leaf && leaf.t === T_TABLE)) finalizeLeaf();
     list = blk(T_LIST);
     list.marker = bullet ? marker : '';
     list.delim = ordered ? delim : '';
@@ -1623,7 +1631,7 @@ function tryListItem(cur, baseCol, leaf, stack, parent, addChild, finalizeLeaf, 
     list.children = [];
     addChild(parent, list);
     isNewList = true;
-  } else if (paraOpen) {
+  } else if (paraOpen || (leaf && leaf.t === T_TABLE)) {
     finalizeLeaf();
   }
   const item = blk(T_ITEM);
