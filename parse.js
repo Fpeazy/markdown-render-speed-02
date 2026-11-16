@@ -365,9 +365,9 @@ function advOne(cur) {
   cur.c++;
 }
 // Columns of whitespace available from the cursor (no mutation).
-function wsCols(cur) {
+function wsCols(cur, col) {
   const s = cur.s;
-  let i = cur.i, c = cur.c, p = cur.p, n = 0;
+  let i = cur.i, c = col === undefined ? cur.c : col, p = cur.p, n = 0;
   if (p > 0) { n += p; i++; c += p; p = 0; }
   while (i < s.length) {
     const ch = s.charCodeAt(i);
@@ -966,8 +966,15 @@ function parseBlocks(src) {
     // as if only the innermost '>' existed (doc-05/09/19: '> > \tX' gives
     // 2 spaces, not 4) — so the outer markers' width is subtracted from
     // the expansion column in Phase C.
+    // contTotal/contLast generalize this to ALL containers (list items
+    // included): contTotal is the sum of the widths of every container
+    // matched on this line, contLast the innermost one's width. The
+    // effective tab column is cur.c - (contTotal - contLast) — the column
+    // as if only the innermost container existed (doc-08: '  > \tX'
+    // inside a list item expands the tab to 2 spaces, not 4).
     let k = 1;
     let bqTotal = 0, bqLast = 0;
+    let contTotal = 0, contLast = 0;
     while (k < stack.length) {
       const b = stack[k];
       const si = cur.i, sc = cur.c, sp = cur.p;
@@ -980,6 +987,7 @@ function parseBlocks(src) {
           if (ch === 32 || ch === 9) adv(cur, 1);
           const w = cur.c - bc0;
           bqTotal += w; bqLast = w;
+          contTotal += w; contLast = w;
           k++;
         } else {
           cur.i = si; cur.c = sc; cur.p = sp;
@@ -989,7 +997,7 @@ function parseBlocks(src) {
         if (isBlankAt(cur)) { k++; continue; }
         const need = b.indent;
         if (need <= 0) { k++; continue; }
-        if (wsCols(cur) >= need) { adv(cur, need); k++; }
+        if (wsCols(cur) >= need) { adv(cur, need); contTotal += need; contLast = need; k++; }
         else break;
       } else {
         k++; // list: no marker of its own
@@ -1252,7 +1260,7 @@ function parseBlocks(src) {
       // A blank remainder must not CREATE a paragraph (cm-240), but it
       // may CONTINUE one (cm-241: '>  ' continues 'foo' with ' ').
       if (isBlankAt(cur) && (!leaf || leaf.t !== T_PARA)) { lineDone = true; break; }
-      const ind = wsCols(cur);
+      const ind = wsCols(cur, cur.c - (contTotal - contLast));
       if (ind >= 4) {
         if (!leaf) {
           // indented code block — a block at a list's level closes it
@@ -1261,7 +1269,10 @@ function parseBlocks(src) {
           const b = blk(T_CODE);
           b.lines = [];
           adv(cur, 4);
-          b.lines.push(rest(cur));
+          // Inside a container, expand tabs in the code content by the
+          // effective column (doc-08: '  > \t\tX' gives '  X', not a
+          // literal tab); at top level the raw content is kept.
+          b.lines.push(stack.length > 1 ? expandTabs(rest(cur), cur.c - (contTotal - contLast)) : rest(cur));
           addChild(top(), b);
           leaf = b;
           lineDone = true;
@@ -1314,8 +1325,10 @@ function parseBlocks(src) {
         b.children = [];
         addChild(top(), b);
         stack.push(b);
+        const w = pcur.c - cur.c;
         cur.i = pcur.i; cur.c = pcur.c; cur.p = pcur.p;
         baseCol = cur.c;
+        contTotal += w; contLast = w;
         continue;
       }
       // 2. ATX heading
@@ -1486,8 +1499,10 @@ function parseBlocks(src) {
         // container too, so a new one goes on the stack under its item
         if (listStart.isNewList) stack.push(listStart.list);
         stack.push(listStart.item);
+        const w = pcur.c - cur.c;
         cur.i = pcur.i; cur.c = pcur.c; cur.p = pcur.p;
         baseCol = cur.c;
+        contTotal += w; contLast = w;
         if (listStart.empty) { lineDone = true; break; }
         continue;
       }
@@ -1511,7 +1526,11 @@ function parseBlocks(src) {
       }
       if (!leaf) {
         const b = blk(T_PARA);
-        b.lines = [rest(cur)];
+        // A leading tab is expanded by the effective column — as if only
+        // the innermost container existed (doc-08: '> \tindented' ->
+        // '  indented'); at top level a leading tab would be indented
+        // code, so this only matters inside a container.
+        b.lines = [expandLeadTabs(rest(cur), cur.c - (contTotal - contLast))];
         closeListIfTop();
         addChild(top(), b);
         leaf = b;
@@ -2212,6 +2231,22 @@ function scanExtDomain(s, textStart, domStart, prefix, openUnd) {
     while (close > open && text.endsWith(')')) {
       text = text.slice(0, -1);
       close--;
+      trimmed = true;
+    }
+    // Unclosed '(': a '(' with no matching ')' AFTER it ends the URL
+    // (doc-08: 'https://sub.domain.example.io)](https://npmjs.com/heading'
+    // stops before the '(' — the ')' BEFORE it does not balance it, so a
+    // plain open/close count is not enough). Track a stack of '('
+    // positions; a ')' pops the most recent one, and any '(' left on the
+    // stack at the end is unclosed — truncate at the first of them.
+    const openStack = [];
+    for (let k = 0; k < text.length; k++) {
+      const ch = text.charCodeAt(k);
+      if (ch === 40) openStack.push(k);
+      else if (ch === 41 && openStack.length > 0) openStack.pop();
+    }
+    if (openStack.length > 0) {
+      text = text.slice(0, openStack[0]);
       trimmed = true;
     }
   }
