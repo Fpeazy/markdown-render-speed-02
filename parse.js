@@ -1061,6 +1061,7 @@ function parseBlocks(src) {
     // whitespace against it.
     let lazyLine = false;
     let lazyIndent = 0;
+    let lazyInQuote = false;
     if (k < stack.length) {
       // A line starting a list marker is not a lazy continuation when a
       // list is open: it is a sibling item (cm-283: '2.') or a new list
@@ -1121,6 +1122,7 @@ function parseBlocks(src) {
         lazyLine = true;
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
+        lazyInQuote = fb.t === T_QUOTE;
       } else if (leaf && leaf.t === T_CODE && leaf.fence !== '' && stack[k].t === T_ITEM && !isBlankAt(cur) && leaf.hasContent) {
         // A list item marker at the list's level ENDS the fence and
         // starts a new item (probe34/doc-13: the '+' line after a
@@ -1272,10 +1274,19 @@ function parseBlocks(src) {
       // leading columns loses min(lead, indent) (the indented-code
       // threshold), a shorter line loses the indent only if it has all
       // of it (cm-291: 4 spaces lost, 3 kept; '- foo' + '   bar' loses 2).
+      // The strip applies ONLY to the FIRST continuation line when the
+      // unmatched container is a BLOCKQUOTE (when the paragraph has
+      // exactly 1 line so far). A later continuation in a blockquote
+      // keeps its leading spaces as literal content (probe47/doc-40:
+      // '> a' + 'x' + '    b' keeps '    b'; '> a' + '    b' strips to
+      // 'b' because it is the first continuation). In other containers
+      // (list items) the strip applies on every continuation (doc-22).
       const lead = wsCols(cur);
       let strip = 0;
-      if (lead >= 4) strip = Math.min(lead, lazyIndent);
-      else if (lead >= lazyIndent) strip = lazyIndent;
+      if (!lazyInQuote || leaf.lines.length === 1) {
+        if (lead >= 4) strip = Math.min(lead, lazyIndent);
+        else if (lead >= lazyIndent) strip = lazyIndent;
+      }
       if (strip > 0) adv(cur, strip);
       // A lazy '=' underline is padded to 4 spaces so it can't be read
       // as a setext underline (marked's quirk, cm-093); a line already
