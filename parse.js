@@ -2257,6 +2257,13 @@ function scanInline(s, refs) {
   // (doc-18: [empty test `` a ` b `` output][all-40] stays literal; the
   // [all-40] then links on its own). A single-backtick span, or a 2+ span
   // with no backtick inside, forms normally.
+  // Returns the index just past the closer of the first 2+ backtick code
+  // span whose content contains a backtick, or -1 if there is none.
+  // A span like `` a ` b `` in link text is a marked quirk: it blocks
+  // the link — but for an INLINE link only when something follows the
+  // span before ']' ('[a `` b ` c ``](url)' forms, '[a `` b ` c `` d]'
+  // and '[a `` b ` c ``_]' do not). A REFERENCE link is blocked by any
+  // such span, wherever it sits (doc-18).
   function linkTextHasBadCodeSpan(text) {
     let i = 0;
     const m = text.length;
@@ -2276,14 +2283,14 @@ function scanInline(s, refs) {
           } else k++;
         }
         if (found >= 0) {
-          if (len >= 2 && text.slice(j, found).indexOf('`') >= 0) return true;
+          if (len >= 2 && text.slice(j, found).indexOf('`') >= 0) return found + len;
           i = found + len;
         } else {
           i = j;
         }
       } else i++;
     }
-    return false;
+    return -1;
   }
 
   // Try to form a link/image at the ']' at s[closeIdx]. Returns the index
@@ -2329,12 +2336,18 @@ function scanInline(s, refs) {
       return -1;
     }
     // A 2+ backtick code span containing a backtick in the link text
-    // blocks a REFERENCE link (marked quirk, see linkTextHasBadCodeSpan;
-    // doc-18). It does NOT block an inline link (doc-05 line 1227 forms
-    // fine), so only apply when the next char is not '('.
-    if (next !== 40 && linkTextHasBadCodeSpan(s.slice(open.ix, closeIdx))) {
-      open.a = false;
-      return -1;
+    // blocks the link (marked quirk, see linkTextHasBadCodeSpan;
+    // doc-18). A reference link is blocked by any such span; an inline
+    // link is blocked only when something follows the span before ']'
+    // ('[a `` b ` c ``](url)' forms — doc-05 line 1227 — but
+    // '[a `` b ` c `` d](url)' and '[a `` b ` c ``_](url)' do not).
+    {
+      const linkText = s.slice(open.ix, closeIdx);
+      const badEnd = linkTextHasBadCodeSpan(linkText);
+      if (badEnd >= 0 && (next !== 40 || badEnd < linkText.length)) {
+        open.a = false;
+          return -1;
+      }
     }
     const clean = cleanUrl(href);
     if (clean === null) {
