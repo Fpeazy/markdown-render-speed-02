@@ -3140,7 +3140,22 @@ function processEmphasis(delims, s) {
             else if (x.ul === 2 && use === 2) {
               for (let yi = xi + 1; yi < di; yi++) {
                 const y = delims[yi];
-                if (y.c === 42 && y.n === 1 && y.l && !y.o) { blockThis = true; blockedByStar = true; break; }
+                if (y.c === 42 && y.n === 1 && y.l && !y.o) {
+                  // The intervening '*' blocks the strong ONLY if it
+                  // has no earlier single-'*' opener to pair with.
+                  // If an opener exists (doc-11: '*input' before
+                  // '**parse**' pairs with the '*' after 'parse'), the
+                  // '*' is handled by that pairing and the strong
+                  // forms. With no opener (probe32: '**a **b**c* d**')
+                  // the '*' blocks the strong and an em forms.
+                  let hasOpener = false;
+                  for (let zi = oi + 1; zi < yi; zi++) {
+                    const z = delims[zi];
+                    if (z.c === 42 && z.n === 1 && z.o && !z.l) { hasOpener = true; break; }
+                  }
+                  if (!hasOpener) { blockThis = true; blockedByStar = true; }
+                  break;
+                }
               }
             }
             if (!blockThis) continue;
