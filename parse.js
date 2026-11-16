@@ -1277,11 +1277,14 @@ function parseBlocks(src) {
     // is paragraph text; in a blockquote, after an earlier lazy line, it
     // is prefixed with 4 spaces so it can never read as an underline.
     if (lastMatched < P.open.length - 1 && P.leaf !== null && P.leaf.t === 'para') {
-      const c2 = curOf(lines[ln]);
-      if (!curBlank(c2) && !startsInterruptingBlock(curOf(lines[ln]), true)) {
+      // work on a copy of the cursor after the matched containers: the
+      // lazy text is the content past them, and a blockquote marker that
+      // only re-enters an already-open container does not interrupt
+      const cc = { s: c.s, i: c.i, col: c.col };
+      if (!curBlank(cc) && !startsInterruptingBlock(cc, true)) {
         const leaf = P.leaf;
-        const sl = setextLevel(curOf(lines[ln]));
-        const c3 = curOf(lines[ln]);
+        const sl = setextLevel({ s: cc.s, i: cc.i, col: cc.col });
+        const c3 = { s: c.s, i: c.i, col: c.col };
         expandLeadTabs(c3);
         // a lazy line indented 4+ columns loses a 4-column indent (it
         // would be indented code as a new block); fewer columns are kept
@@ -1884,6 +1887,8 @@ function renderInline(text, refs) {
           flushText();
           appendNode({ t: 'br' });
           i += 2;
+          // after a hard break, leading whitespace on the next line is skipped
+          while (i < n && (text.charCodeAt(i) === 32 || text.charCodeAt(i) === 9)) i++;
           continue;
         }
         if (isPunct(nc)) {
@@ -2017,10 +2022,13 @@ function renderInline(text, refs) {
         buf = buf.slice(0, k);
         flushText();
         appendNode({ t: 'br' });
+        i++;
+        // after a hard break, leading whitespace on the next line is skipped
+        while (i < n && (text.charCodeAt(i) === 32 || text.charCodeAt(i) === 9)) i++;
       } else {
         buf += '\n';
+        i++;
       }
-      i++;
       continue;
     }
     // extended autolinks (www / scheme / email) in plain text
