@@ -1001,7 +1001,20 @@ function parseBlocks(src) {
           break;
         }
       } else if (b.t === T_ITEM) {
-        if (isBlankAt(cur)) { k++; continue; }
+        if (isBlankAt(cur)) {
+          // A blank line inside an item still consumes the item indent
+          // (up to the whitespace available), so later stages see the
+          // content position, not the raw line start (doc-08: a ' '
+          // blank line in a ```go fence inside an item contributes an
+          // empty line, not ' ').
+          const need = b.indent;
+          if (need > 0) {
+            const avail = wsCols(cur);
+            adv(cur, Math.min(avail, need));
+            contTotal += Math.min(avail, need); contLast = Math.min(avail, need);
+          }
+          k++; continue;
+        }
         const need = b.indent;
         if (need <= 0) { k++; continue; }
         if (wsCols(cur) >= need) { adv(cur, need); contTotal += need; contLast = need; k++; }
@@ -1079,7 +1092,7 @@ function parseBlocks(src) {
         lazyLine = true;
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
-      } else if (leaf && leaf.t === T_CODE && leaf.fence !== '' && stack[k].t === T_ITEM && !isBlankAt(cur) && leaf.lines.length > 0) {
+      } else if (leaf && leaf.t === T_CODE && leaf.fence !== '' && stack[k].t === T_ITEM && !isBlankAt(cur) && leaf.hasContent) {
         // Fenced code inside a list item: once the block HAS content, a
         // non-indented line does NOT close the item — it is code content
         // (marked/doc-02: the 'function f(a, b) {' line at col 0 stays
@@ -1235,8 +1248,11 @@ function parseBlocks(src) {
       }
       const codeText = rest(cur);
       // Only leading tabs are expanded (a tab after other content, e.g.
-      // '> \tindented' inside a fence, stays literal — doc-08).
+      // '> \tindented' inside a fence, stays literal — doc-08). The
+      // expansion column uses the blockquote-only correction (outer '>'
+      // markers subtracted); the list-item indent is NOT subtracted here.
       leaf.lines.push(k > 1 ? expandLeadTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
+      leaf.hasContent = true;
       continue;
     }
     if (leaf && leaf.t === T_CODE) {
@@ -1399,6 +1415,7 @@ function parseBlocks(src) {
             b.fenceInd = ind;
             b.info = info.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
             b.lines = [];
+            b.hasContent = false; // set when a non-blank content line is added (blank lines don't count; doc-08)
             addChild(top(), b);
             leaf = b;
             lineDone = true;
