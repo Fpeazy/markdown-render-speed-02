@@ -193,8 +193,10 @@ function cleanUrl(url, isImage) {
 // ---------- link reference definitions ----------
 // Label normalization: collapse internal whitespace to one space, trim,
 // casefold (lowercase).
+// Unicode case folding for label matching (cm-540): ß/ẞ fold to 'ss'
+// (ẞ must match a refdef labelled SS), final sigma ς folds to σ.
 function normalizeLabel(s) {
-  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+  return s.replace(/\s+/g, ' ').trim().replace(/[ßẞ]/g, 'ss').replace(/ς/g, 'σ').toLowerCase();
 }
 
 // Parse a link destination starting at src[i] (i points at '<' or first char).
@@ -501,6 +503,9 @@ function parseBlocks(text, ctx) {
         if (def) {
           // first definition wins (cm-204)
           if (!ctx.refs.has(def.label)) ctx.refs.set(def.label, { dest: def.dest, title: def.title });
+          // a refdef between blocks makes the enclosing list loose
+          // (cm-317: a blank line before a refdef inside a list item)
+          markBlock();
           const consumed = rest.slice(0, def.end);
           const nl = (consumed.match(/\n/g) || []).length;
           i += nl + 1;
@@ -792,6 +797,7 @@ function gatherList(lines, i, ctx) {
   const ordered = first.ordered;
   const delim = ordered ? first.delim : first.bullet;
   const items = [];
+  const itemLazy = []; // per-item Set of lazy-continuation line indexes
   let loose = false;
   let j = i;
   while (j < lines.length) {
@@ -812,6 +818,7 @@ function gatherList(lines, i, ctx) {
     if (!sameListMarker(lm, ordered, delim) || indentOf(lines[j]) > 3) break;
     const ci = lm.contentIndent;
     const itemLines = [stripListMarker(expandTabs(lines[j], 0), lm)];
+    const lazyIdx = new Set();
     j++;
     while (j < lines.length) {
       const l = expandTabs(lines[j], 0);
@@ -821,25 +828,35 @@ function gatherList(lines, i, ctx) {
         if (k >= lines.length) { j = k; break; }
         // a thematic break ends the item (and the list)
         if (isHr(expandTabs(lines[k], 0))) break;
-        const lm2 = listMarker(expandTabs(lines[k], 0));
-        if (sameListMarker(lm2, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; break; }
+        // a line indented to the item's content indent belongs to the
+        // item (a nested list), even if it is a list marker of the same
+        // kind (doc-01: '  * [x]...' inside an item with ci=2); check
+        // this BEFORE the same-marker test, or the nested list is read
+        // as a new item of the enclosing list
         if (indentOf(lines[k]) >= ci) {
           // an empty item ends at a blank line (cm-280)
           if (itemLines.every(l => isBlankLine(l))) break;
           for (let b = j; b < k; b++) itemLines.push('');
           j = k; continue;
         }
+        const lm2 = listMarker(expandTabs(lines[k], 0));
+        if (sameListMarker(lm2, ordered, delim) && indentOf(lines[k]) <= 3) { loose = true; j = k; break; }
         break; // blank ends the item (paragraph closed, no lazy after blank)
       }
       if (indentOf(l) >= ci) { itemLines.push(stripIndentCols(l, ci)); j++; continue; }
       const lm2 = listMarker(l);
-      if (sameListMarker(lm2, ordered, delim) && indentOf(l) <= 3) break;
+      // ANY list-marker line ends the item, not just a same-delimiter
+      // one (cm-302: a '3)' line after '1.'/'2.' items ends the list
+      // and starts a new '<ol start="3">')
+      if (lm2) break;
       const prev = itemLines.length ? itemLines[itemLines.length - 1] : null;
       if (prev !== null && prevIsParagraphLine(prev) && !interruptsParagraph(l)) {
         // lazy line: strip 4 columns iff indent >= 4 (cm-291)
+        const idx = itemLines.length;
         let il = l;
         if (indentOf(il) >= 4) il = stripIndentCols(il, 4);
         itemLines.push(il);
+        lazyIdx.add(idx);
         j++;
         continue;
       }
@@ -847,13 +864,16 @@ function gatherList(lines, i, ctx) {
     }
     while (itemLines.length && isBlankLine(itemLines[itemLines.length - 1])) itemLines.pop();
     items.push(itemLines);
+    itemLazy.push(lazyIdx);
     if (j < lines.length && !isBlankLine(lines[j])) {
       const lm3 = listMarker(expandTabs(lines[j], 0));
       if (!sameListMarker(lm3, ordered, delim) || indentOf(lines[j]) > 3) break;
     }
   }
-  const itemNodes = items.map(itemLines => {
-    const sub = parseBlocks(itemLines.join('\n'), { refs: ctx.refs, lazy: new Set(), endsWithNL: false });
+  const itemNodes = items.map((itemLines, idx) => {
+    // lazy lines inside an item are paragraph continuations, not new
+    // blocks (cm-312: a lazy '- e' line stays in the paragraph)
+    const sub = parseBlocks(itemLines.join('\n'), { refs: ctx.refs, lazy: itemLazy[idx], endsWithNL: false });
     if (sub.hadInterBlockBlank) loose = true;
     const nodes = sub.nodes;
     // GFM task list: first paragraph starting with '[ ] '/'[x] '/'[X] '
@@ -931,9 +951,11 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
   const opener = nodes[openerIdx];
   const linkTextEnd = pos; // ']' is at pos
   let p = pos + 1;
-  // inline link: optional ws then '('
-  const q = skipWsNoBlank(text, p);
-  if (q >= 0 && text[q] === '(') {
+  // inline link: '(' must DIRECTLY follow ']' (cm-511: '[link] (/uri)'
+  // and '[link]\n(/uri)' are literal text, not links). The reference
+  // branch below still allows whitespace before '['.
+  if (text[p] === '(') {
+    const q = p;
     let r = skipWsNoBlank(text, q + 1);
     if (r >= 0) {
       const d = parseDest(text, r);
@@ -1012,16 +1034,25 @@ function makeLinkNode(opener, nodes, openerIdx, destRaw, titleRaw, refs) {
 // Inline HTML tag at text[i] === '<'. Returns {html, end} or null.
 function scanInlineHtml(text, i) {
   const rest = text.slice(i, i + 500);
-  let m = /^<!--(?:(?!-->)[\s\S])*?-->/.exec(rest);
-  if (m) return { html: m[0], end: i + m[0].length };
+  // abrupt-close comments (cm-626): '<!-->' and '<!--->' are complete
+  // comments; check before the general comment rule, and a comment's
+  // content must not contain '--'.
+  if (rest.startsWith('<!-->')) return { html: '<!-->', end: i + 5 };
+  if (rest.startsWith('<!--->')) return { html: '<!--->', end: i + 6 };
+  let m = /^<!--([\s\S]*?)-->/.exec(rest);
+  if (m && !m[1].includes('--')) return { html: m[0], end: i + m[0].length };
   m = /^<\?(?:(?!\?>)[\s\S])*?\?>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
   m = /^<![A-Za-z][\s\S]*?>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
   m = /^<!\[CDATA\[(?:(?!\]\]>)[\s\S])*?\]\]>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
-  // open/close tag (attributes may be separated by newlines, cm-491)
-  m = /^<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>/.exec(rest);
+  // a closing tag cannot have attributes (cm-624: '</a href="foo">' is
+  // escaped literal text); an opening tag may (attributes may be
+  // separated by newlines, cm-491)
+  m = /^<\/[A-Za-z][A-Za-z0-9-]*\s*>/.exec(rest);
+  if (m) return { html: m[0], end: i + m[0].length };
+  m = /^<[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
   return null;
 }
@@ -1097,7 +1128,9 @@ function tokenizeInline(text, refs) {
     const c = text[i];
     // backslash escape / hard break
     if (c === '\\') {
-      if (i + 1 < n && text[i + 1] === '\n') { flush(); nodes.push({ t: 'br' }); i += 2; continue; }
+      // a hard break strips the leading spaces/tabs of the next line
+      // (cm-636/637: 'foo \\\n bar' -> 'foo<br>bar')
+      if (i + 1 < n && text[i + 1] === '\n') { flush(); nodes.push({ t: 'br' }); i += 2; while (i < n && (text[i] === ' ' || text[i] === '\t')) i++; continue; }
       if (i + 1 < n && isPunct(text[i + 1])) { buf += text[i + 1]; i += 2; continue; }
       buf += c; i++; continue;
     }
@@ -1191,6 +1224,15 @@ function tokenizeInline(text, refs) {
           i = res.end;
           continue;
         }
+        // tryLink failed: deactivate this opener so a later ']' cannot
+        // use it (cm-513: a failed ] deactivates its [).
+        nodes[oi].active = false;
+      } else if (oi >= 0) {
+        // nearest opener is inactive: it can never form a link, so render
+        // it as literal text (and this ']' as literal). That frees a
+        // later ']' to match an earlier IMAGE opener (cm-520:
+        // '![[foo](uri1)](uri2)](uri3)' forms the image at the last ']').
+        nodes[oi] = { t: 'text', s: nodes[oi].kind === 'image' ? '![' : '[' };
       }
       buf += ']'; i++; continue;
     }
@@ -1211,11 +1253,11 @@ function tokenizeInline(text, refs) {
         if (g) { flush(); nodes.push({ t: 'autolink', href: g.href, text: g.text }); i = g.end; continue; }
       }
     }
-    // newline: hard break (2+ trailing spaces) or soft break
+    // newline: hard break (2+ trailing spaces) or soft break; a hard
+    // break strips the leading spaces/tabs of the next line (cm-636/637)
     if (c === '\n') {
-      if (/ {2,}$/.test(buf)) { buf = buf.replace(/ +$/, ''); flush(); nodes.push({ t: 'br' }); }
-      else { buf += '\n'; }
-      i++; continue;
+      if (/ {2,}$/.test(buf)) { buf = buf.replace(/ +$/, ''); flush(); nodes.push({ t: 'br' }); i++; while (i < n && (text[i] === ' ' || text[i] === '\t')) i++; continue; }
+      buf += '\n'; i++; continue;
     }
     buf += c; i++;
   }
@@ -1358,7 +1400,10 @@ function renderBlocks(nodes, ctx) {
         let lang = '';
         const info = nd.info.trim();
         if (info) lang = escapeAttr(unescapeBackslash(info.split(/\s+/)[0]));
-        out += '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + escapeText(nd.text) + (nd.text ? '\n' : '') + '</code></pre>\n';
+        // trailing blank lines inside the fence are content (cm-318:
+        // '```\nb\n\n\n```' -> 'b\n\n', not 'b\n\n\n'), so add a '\n'
+        // only when the content does not already end with one
+        out += '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + escapeText(nd.text) + (nd.text && !nd.text.endsWith('\n') ? '\n' : '') + '</code></pre>\n';
         break;
       }
       case 'html': {
