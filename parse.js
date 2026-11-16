@@ -487,6 +487,10 @@ function handleBlank(P, leafReachable, c) {
     if (leaf.t === 'html' && leaf.s.endsWith('\n')) leaf.s = leaf.s.slice(0, -1);
     closeLeaf(P);
   }
+  // an HTML block that already completed (its end marker was on its first
+  // line) and is followed by a blank line also loses its trailing newline
+  const lb = P.lastBlock;
+  if (lb && lb.t === 'html' && lb.s.endsWith('\n')) lb.s = lb.s.slice(0, -1);
   P.pendBlank = true;
 }
 
@@ -1279,6 +1283,9 @@ function parseBlocks(src) {
         const sl = setextLevel(curOf(lines[ln]));
         const c3 = curOf(lines[ln]);
         expandLeadTabs(c3);
+        // a lazy line indented 4+ columns loses a 4-column indent (it
+        // would be indented code as a new block); fewer columns are kept
+        if (curIndent(c3) >= 4) curAdv(c3, 4);
         let lineText = curRest(c3);
         if (sl === 1 && leaf.lazy && P.open[lastMatched + 1].t === 'quote') {
           lineText = '    ' + lineText.replace(/^[ \t]+/, '');
