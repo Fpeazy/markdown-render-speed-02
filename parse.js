@@ -437,7 +437,11 @@ function listMarker(line) {
 
 // Can this line start a block that interrupts a paragraph? (Indented code
 // and HTML type 7 cannot.) Returns the block kind or null.
-function interruptsParagraph(line) {
+// inList: inside a list item's inner parse, an ordered list marker with
+// ANY start number interrupts the paragraph (marked: '+ foo\n  49. bar'
+// starts a nested <ol start="49">; at top level / in quotes only
+// start==1 can interrupt, per CommonMark).
+function interruptsParagraph(line, inList) {
   if (indentOf(line) > 3) return null;
   if (atxHeading(line)) return 'atx';
   if (fenceStart(line)) return 'fence';
@@ -448,7 +452,7 @@ function interruptsParagraph(line) {
   const lm = listMarker(line);
   if (lm && !lm.empty) {
     if (!lm.ordered) return 'list';
-    if (lm.start === 1) return 'list';
+    if (lm.start === 1 || inList) return 'list';
   }
   return null;
 }
@@ -651,7 +655,7 @@ function gatherParagraph(lines, i, ctx) {
           i++;
           const rows = [];
           while (i < lines.length && !isBlankLine(lines[i])) {
-            if (interruptsParagraph(lines[i])) break;
+            if (interruptsParagraph(lines[i], ctx.inList)) break;
             const cells = splitTableRow(lines[i]);
             while (cells.length < header.length) cells.push('');
             rows.push(cells.slice(0, header.length));
@@ -664,7 +668,7 @@ function gatherParagraph(lines, i, ctx) {
     // lazy lines continue the paragraph without interrupt checks
     if (ctx.lazy && ctx.lazy.has(i)) { pLines.push(line); i++; continue; }
     // interrupting blocks end the paragraph
-    if (interruptsParagraph(line)) break;
+    if (interruptsParagraph(line, ctx.inList)) break;
     pLines.push(line);
     i++;
   }
@@ -873,7 +877,9 @@ function gatherList(lines, i, ctx) {
   const itemNodes = items.map((itemLines, idx) => {
     // lazy lines inside an item are paragraph continuations, not new
     // blocks (cm-312: a lazy '- e' line stays in the paragraph)
-    const sub = parseBlocks(itemLines.join('\n'), { refs: ctx.refs, lazy: itemLazy[idx], endsWithNL: false });
+    // inList: inside an item, an ordered marker with any start number
+    // interrupts the item's paragraph and starts a nested list
+    const sub = parseBlocks(itemLines.join('\n'), { refs: ctx.refs, lazy: itemLazy[idx], endsWithNL: false, inList: true });
     if (sub.hadInterBlockBlank) loose = true;
     const nodes = sub.nodes;
     // GFM task list: first paragraph starting with '[ ] '/'[x] '/'[X] '
@@ -992,11 +998,12 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
       }
     }
   }
-  // reference link: [label] / [] / shortcut
-  const q2 = skipWsNoBlank(text, p);
+  // reference link: the label bracket must IMMEDIATELY follow ']' —
+  // '[foo] [bar]' (any whitespace between, incl. newline) is two
+  // shortcut links, never a full reference (cm-542/543).
   let emptyLabelEnd = -1;
-  if (q2 >= 0 && text[q2] === '[') {
-    const lab = scanLabel(text, q2);
+  if (text[p] === '[') {
+    const lab = scanLabel(text, p);
     if (!lab) return null;
     const key = normalizeLabel(lab.label);
     if (key !== '') {
@@ -1107,9 +1114,12 @@ function trimGfmUrl(url) {
       break;
     }
     if (c === ';') {
+      // Trailing ';': if it completes a NAMED entity (&name;), the
+      // whole entity is outside the URL; otherwise only the ';' goes.
+      // Numeric entities (&#123;) keep '&#123' and lose just the ';'.
       const amp = u.lastIndexOf('&');
-      if (amp >= 0 && /^&[A-Za-z0-9]+;$/.test(u.slice(amp))) { u = u.slice(0, -1); continue; }
-      break;
+      if (amp >= 0 && /^&[A-Za-z][A-Za-z0-9]*;$/.test(u.slice(amp))) { u = u.slice(0, amp); continue; }
+      u = u.slice(0, -1); continue;
     }
     if ('?!.,:*_~\'"'.includes(c)) { u = u.slice(0, -1); continue; }
     break;
@@ -1224,9 +1234,14 @@ function tokenizeInline(text, refs) {
           i = res.end;
           continue;
         }
-        // tryLink failed: deactivate this opener so a later ']' cannot
-        // use it (cm-513: a failed ] deactivates its [).
-        nodes[oi].active = false;
+        // tryLink failed: this opener can never form a link, so turn
+        // it into literal text NOW (do not leave it as an inactive
+        // opener — a later ']' must be able to reach an EARLIER active
+        // opener, e.g. cm-512 '[link [foo [bar]]](/uri)' forms the link
+        // at the last ']'). A formed link still deactivates earlier
+        // LINK openers (they stay inactive so cm-520's image forms at
+        // the last ']' instead of an earlier one).
+        nodes[oi] = { t: 'text', s: nodes[oi].kind === 'image' ? '![' : '[' };
       } else if (oi >= 0) {
         // nearest opener is inactive: it can never form a link, so render
         // it as literal text (and this ']' as literal). That frees a
