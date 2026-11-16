@@ -1,49 +1,21 @@
-// Driver for the markdown-render-speed-02 entry.
-//
-// Renders every case from the input directory through parse() (parse.js)
-// and writes the HTML strings, in case order, to the output directory.
-// Each case is rendered independently — no state is shared between
-// cases — so the output is deterministic for a given input. Outside a
-// container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for
-// /input and /output.
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+// main.ts — driver for the markdown-render-speed-02 entry.
+// Reads every case from $MAKEFUN_INPUT_DIR/cases.json (default /input),
+// renders each with parse() from ./parse.js, and writes the HTML strings
+// in order to $MAKEFUN_OUTPUT_DIR/html.json (default /output).
+// Runs as `node main.ts` on Node 22 (type stripping, erasable syntax only).
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
 type Case = { id: string; markdown: string };
 
-const INPUT_ENV = 'MAKEFUN_INPUT_DIR';
-const OUTPUT_ENV = 'MAKEFUN_OUTPUT_DIR';
-const DEFAULT_INPUT = '/input';
-const DEFAULT_OUTPUT = '/output';
-const CASES_FILE = 'cases.json';
-const HTML_FILE = 'html.json';
+const inputDir: string = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir: string = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// Load and validate the case list from the input directory.
-function loadCases(dir: string): Case[] {
-  const raw = readFileSync(join(dir, CASES_FILE), 'utf8');
-  const parsed: unknown = JSON.parse(raw);
-  if (!Array.isArray(parsed)) throw new Error(`${CASES_FILE} is not an array`);
-  return parsed as Case[];
+const cases: Case[] = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8'));
+const html: string[] = new Array(cases.length);
+for (let i = 0; i < cases.length; i++) {
+  html[i] = parse(cases[i].markdown);
 }
-
-// Render every case on its own; the per-case call keeps parse() stateless.
-function renderCases(cases: Case[]): string[] {
-  const html: string[] = new Array(cases.length);
-  for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
-  return html;
-}
-
-// Persist the rendered HTML (one entry per case, in case order).
-function saveHtml(dir: string, html: string[]): void {
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, HTML_FILE), JSON.stringify(html));
-}
-
-function run(): void {
-  const inputDir = process.env[INPUT_ENV] ?? DEFAULT_INPUT;
-  const outputDir = process.env[OUTPUT_ENV] ?? DEFAULT_OUTPUT;
-  saveHtml(outputDir, renderCases(loadCases(inputDir)));
-}
-
-run();
+mkdirSync(outputDir, { recursive: true });
+writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
