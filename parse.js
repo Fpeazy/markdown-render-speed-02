@@ -1722,7 +1722,7 @@ function matchExtAutolink(s, i, prev) {
 // as not-whitespace and not-punctuation, which is correct for them) Unicode
 // whitespace / punctuation?
 const WS_RE = /\p{White_Space}/u;
-const P_RE = /\p{P}/u;
+const P_RE = /[\p{P}\p{S}]/u;
 function isWsU(c) {
   return c < 128 ? isSpace(c) : WS_RE.test(String.fromCharCode(c));
 }
@@ -2191,8 +2191,10 @@ function processEmphasis(delims, nodes, collectBetween) {
         while (o !== null) {
           if (o.len === 0) {
             // a consumed delimiter that could open is a barrier for a
-            // closer that cannot open
-            if (o.canOpen && !d.canOpen) break;
+            // closer that cannot open — unless the closer is the same
+            // length as the consumed delimiter was, in which case it may
+            // pass through to an opener beyond it (e.g. `*(*foo*)*`)
+            if (o.canOpen && !d.canOpen && d.len !== o.orig) break;
             o = o.prev;
             continue;
           }
