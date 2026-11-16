@@ -12,11 +12,17 @@ The parser is a single pass over the source, in two phases:
 
 - **Blocks** (`parseBlocks`): container matching (blockquotes, lists, fenced
   code), lazy continuation, and leaf starts, with a fixed-shape record per
-  block and a line cursor that tracks tab stops by absolute column.
+  block and a line cursor that tracks tab stops by absolute column. Tab
+  columns are measured at the effective column (outer containers
+  subtracted), and the correction differs by innermost container.
 - **Inline** (`scanInline` + `processEmphasis`): a delimiter-stack emphasis
   pass, reference/inline links, GFM tables, extended autolinks
   (`www.` / scheme / email), and HTML blocks — all rendered to HTML in one
-  walk, with no per-frame allocation in the hot loops.
+  walk, with no per-frame allocation in the hot loops. A code span never
+  crosses a `]` that actually forms a link (a len≥2 span holding another
+  backtick does not protect the `]`), and an emphasis run after a link
+  whose text holds an unmatched backtick is suppressed exactly when a
+  backtick follows it.
 
 Speed comes from the shape of the work, not from shortcuts: one pass, no
 re-scanning, monomorphic call sites, packed arrays, `+=` string building
@@ -26,10 +32,10 @@ lookup of case outputs — the parser is genuinely fast on any document.
 
 ## Correctness
 
-Every change is verified against all 680 CommonMark 0.31.2 + GFM 0.29 spec
-examples and the 40 generated long documents in the practice set, byte for
-byte against marked 18.1.3. The parser is developed against marked as a
-black-box oracle only; marked's source is never read or copied.
+Verified byte for byte against marked 18.1.3 on all 720 practice cases:
+all 680 CommonMark 0.31.2 + GFM 0.29 spec examples and all 40 generated
+long documents. The parser is developed against marked as a black-box
+oracle only; marked's source is never read or copied.
 
 ## Run it
 
