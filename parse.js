@@ -343,7 +343,7 @@ function mkPara() { return { t: 'para', s: '', lines: 0 }; }
 function mkHead(l) { return { t: 'head', l, s: '' }; }
 function mkCode() { return { t: 'code', s: '' }; }
 function mkFence(ch, len, info, indent) { return { t: 'fence', ch, len, info, indent, s: '' }; }
-function mkHtml(kind, endRe) { return { t: 'html', kind, endRe, s: '' }; }
+function mkHtml(kind, end) { return { t: 'html', kind, end, s: '' }; }
 function mkQuote() { return { t: 'quote', ch: [] }; }
 function mkList(ordered, start) { return { t: 'list', o: ordered, st: start, tight: true, ch: [], blank: false }; }
 function mkItem(indent) { return { t: 'item', ch: [], indent, checked: null }; }
@@ -815,7 +815,13 @@ function htmlStart(c, canInterrupt) {
   if (BLOCK_TAGS.has(name)) { c.i = saveI; c.col = saveCol; c.s = saveS; return { kind: 6, end: null }; }
   if (!canInterrupt) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   // type 7: any other tag, but only when the tag is complete on this line
-  if (parseHtmlTag(s, c.i) === 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
+  // AND alone on it (nothing but whitespace after the tag); otherwise the
+  // line is a paragraph with inline HTML
+  const tagEnd = parseHtmlTag(s, c.i);
+  if (tagEnd === 0) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
+  let k = tagEnd;
+  while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9)) k++;
+  if (k < n) { c.i = saveI; c.col = saveCol; c.s = saveS; return null; }
   c.i = saveI; c.col = saveCol; c.s = saveS;
   return { kind: 7, end: null };
 }
@@ -1045,8 +1051,12 @@ function startNewBlock(P, c, container, wasBlank) {
     const html = mkHtml(h.kind, h.end);
     html.s = curRest(c) + '\n';
     addChild(P, container, html, wasBlank);
-    P.leaf = html;
-    P.leafParent = container;
+    // a type 1-5 block whose end marker is already on this first line is
+    // complete at once and is not left open
+    if (h.end === null || html.s.indexOf(h.end) < 0) {
+      P.leaf = html;
+      P.leafParent = container;
+    }
     return;
   }
   // thematic break
@@ -1261,7 +1271,15 @@ function parseBlocks(src) {
       closeContainer(P, P.open.pop());
     }
     const leafReachable = P.leaf !== null && P.leafParent === P.open[lastMatched];
-    if (P.leaf !== null && !leafReachable) closeLeaf(P);
+    if (P.leaf !== null && !leafReachable) {
+      // an HTML block of kind 6-7 that ends because a blank line closed
+      // its container loses its trailing newline, as if the blank line
+      // had ended it directly
+      if (curBlank(c) && P.leaf.t === 'html' && (P.leaf.kind === 6 || P.leaf.kind === 7) && P.leaf.s.endsWith('\n')) {
+        P.leaf.s = P.leaf.s.slice(0, -1);
+      }
+      closeLeaf(P);
+    }
     if (curBlank(c)) {
       handleBlank(P, leafReachable, c);
       continue;
