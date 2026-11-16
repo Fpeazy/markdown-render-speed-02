@@ -196,16 +196,22 @@ function cleanUrl(url) {
   const n = url.length;
   while (i < n) {
     const ch = url.charCodeAt(i);
-    if (ch === 37 && i + 2 < n) {
-      const h1 = url.charCodeAt(i + 1);
-      const h2 = url.charCodeAt(i + 2);
-      const hex1 = (h1 >= 48 && h1 <= 57) || (h1 >= 65 && h1 <= 70) || (h1 >= 97 && h1 <= 102);
-      const hex2 = (h2 >= 48 && h2 <= 57) || (h2 >= 65 && h2 <= 70) || (h2 >= 97 && h2 <= 102);
-      if (hex1 && hex2) {
-        out += url.slice(i, i + 3);
-        i += 3;
-        continue;
+    if (ch === 37) {
+      if (i + 2 < n) {
+        const h1 = url.charCodeAt(i + 1);
+        const h2 = url.charCodeAt(i + 2);
+        const hex1 = (h1 >= 48 && h1 <= 57) || (h1 >= 65 && h1 <= 70) || (h1 >= 97 && h1 <= 102);
+        const hex2 = (h2 >= 48 && h2 <= 57) || (h2 >= 65 && h2 <= 70) || (h2 >= 97 && h2 <= 102);
+        if (hex1 && hex2) {
+          out += url.slice(i, i + 3);
+          i += 3;
+          continue;
+        }
       }
+      // a lone % is kept as-is (marked does not encode it)
+      out += '%';
+      i++;
+      continue;
     }
     let j = i + 1;
     while (j < n && url.charCodeAt(j) !== 37) j++;
@@ -1866,17 +1872,19 @@ function renderInline(text, refs) {
       const il = parseInlineLink(text, j);
       if (il !== null) { dest = il.dest; title = il.title; end = il.end; }
     } else if (j < n && text.charCodeAt(j) === 91) {
-      const lb = parseRefLabel(text, j);
-      if (lb !== null) {
-        const key = normLabel(text.slice(j + 1, lb.end - 1));
-        if (key !== '' && refs.has(key)) {
-          const r = refs.get(key);
-          dest = r.dest; title = r.title; end = lb.end;
-        } else if (lb.end === j + 2) {
-          // collapsed reference: [label][]
-          const key2 = linkTextOf(br);
-          if (key2 !== '' && refs.has(key2)) {
-            const r = refs.get(key2);
+      if (j + 1 < n && text.charCodeAt(j + 1) === 93) {
+        // collapsed reference [label][]: the label is the link text
+        const key2 = linkTextOf(br);
+        if (key2 !== '' && refs.has(key2)) {
+          const r = refs.get(key2);
+          dest = r.dest; title = r.title; end = j + 2;
+        }
+      } else {
+        const lb = parseRefLabel(text, j);
+        if (lb !== null) {
+          const key = normLabel(text.slice(j + 1, lb.end - 1));
+          if (key !== '' && refs.has(key)) {
+            const r = refs.get(key);
             dest = r.dest; title = r.title; end = lb.end;
           }
         }
@@ -2239,7 +2247,29 @@ function oddMatchBlocked(o, d) {
 
 // Resolve emphasis/strikethrough over the delimiter list. Closers are
 // processed in order; each looks back for the nearest usable opener.
+// Walk a node list, recording for every leaf node the link node whose
+// text it sits inside (or null). Used to tag emphasis delimiters with
+// their link scope so emphasis never matches across a link boundary.
+function walkLinkScope(head, link, nodeLink) {
+  let nd = head;
+  while (nd !== null) {
+    if (nd.t === 'link') {
+      if (nd.chHead) walkLinkScope(nd.chHead, nd, nodeLink);
+    } else if (nd.t === 'em' || nd.t === 'strong' || nd.t === 'del') {
+      if (nd.chHead) walkLinkScope(nd.chHead, link, nodeLink);
+    } else {
+      nodeLink.set(nd, link);
+    }
+    nd = nd.next;
+  }
+}
+
 function processEmphasis(delims, nodes, collectBetween) {
+  // tag each delimiter with the link it sits inside (null = outside)
+  const nodeLink = new Map();
+  walkLinkScope(nodes.head, null, nodeLink);
+  let dd = delims.head;
+  while (dd !== null) { dd.link = nodeLink.get(dd.node) || null; dd = dd.next; }
   let d = delims.head;
   while (d !== null) {
     const nextD = d.next;
@@ -2248,6 +2278,9 @@ function processEmphasis(delims, nodes, collectBetween) {
         let o = d.prev;
         let found = null;
         while (o !== null) {
+          // a delimiter only interacts with delimiters in its own scope:
+          // inside the same link, or both outside all links
+          if (o.link !== d.link) { o = o.prev; continue; }
           if (o.len === 0) {
             // a consumed delimiter is a barrier for a closer that cannot
             // open only when it was itself used as a closer, and only
