@@ -186,7 +186,8 @@ function cleanUrl(url, isImage) {
     if (!isImage) return null;
     if (!/^data:image\//.test(dec)) return null;
   }
-  try { return encodeURI(url); } catch { return null; }
+  // encodeURI then restore '%' (marked keeps bare '%' and valid %XX as-is)
+  try { return encodeURI(url).replace(/%25/g, '%'); } catch { return null; }
 }
 
 // ---------- link reference definitions ----------
@@ -344,7 +345,7 @@ const HTML_BLOCK_TAGS = new Set(('address article aside base basefont blockquote
 function htmlBlockStart(line) {
   // returns {type, endRe} or null; line already has indent <= 3
   const s = line.replace(/^[ \t]*/, '');
-  if (/^<(?:pre|script|style|textarea)(?:[ \t>]|\/>)/i.test(s)) return { type: 1 };
+  if (/^<(?:pre|script|style|textarea)(?:[ \t>]|\/>|$)/i.test(s)) return { type: 1 };
   if (/^<!--/.test(s)) return { type: 2 };
   if (/^<\?/.test(s)) return { type: 3 };
   if (/^<![A-Za-z]/.test(s)) return { type: 4 };
@@ -556,7 +557,14 @@ function parseBlocks(text, ctx) {
         while (i < lines.length && !isBlankLine(lines[i])) { buf.push(lines[i]); i++; }
       }
       markBlock();
-      nodes.push({ t: 'html', text: buf.join('\n') });
+      // trailing '\n' iff the line right after the block is non-blank,
+      // or the block is the last block and the text ends with '\n' and
+      // the block text does not already end with one (cm-148/149/150/173)
+      const text = buf.join('\n');
+      const nextNonBlank = i < lines.length && !isBlankLine(lines[i]);
+      const moreContent = lines.slice(i).some(l => !isBlankLine(l));
+      const trailNL = nextNonBlank || (ctx.endsWithNL && !moreContent && !text.endsWith('\n'));
+      nodes.push({ t: 'html', text, trailNL });
       continue;
     }
 
@@ -1088,8 +1096,13 @@ function tokenizeInline(text, refs) {
       if (oi >= 0 && nodes[oi].active) {
         const res = tryLink(text, i, nodes, oi, refs);
         if (res) {
-          // deactivate all earlier openers
-          for (let k = 0; k < oi; k++) if (nodes[k].t === 'open') nodes[k].active = false;
+          // A formed LINK deactivates earlier LINK openers (not image
+          // openers: ![a [b](c)](d) still forms the image). A formed IMAGE
+          // deactivates nothing (badge pattern [![alt](src)](url) must
+          // still form the outer link).
+          if (res.node.t === 'link') {
+            for (let k = 0; k < oi; k++) if (nodes[k].t === 'open' && nodes[k].kind === 'link') nodes[k].active = false;
+          }
           flush();
           nodes.splice(oi, nodes.length - oi, res.node);
           i = res.end;
@@ -1232,11 +1245,14 @@ function parseInline(text, refs) {
 
 // ---------- block rendering ----------
 function renderListItem(itemNodes, tight, ctx) {
-  if (!tight) return renderBlocks(itemNodes, ctx);
+  // inner text never ends with '\n': render with an inner ctx so blocks
+  // at the end of an item get no trailing newline (cm-175)
+  const innerCtx = { refs: ctx.refs, lazy: new Set(), endsWithNL: false };
+  if (!tight) return renderBlocks(itemNodes, innerCtx);
   const parts = [];
   for (const nd of itemNodes) {
     if (nd.t === 'p') parts.push(parseInline(nd.text, ctx.refs));
-    else parts.push(renderBlocks([nd], ctx));
+    else parts.push(renderBlocks([nd], innerCtx));
   }
   return parts.join('');
 }
@@ -1260,7 +1276,7 @@ function renderBlocks(nodes, ctx) {
       }
       case 'html': {
         out += nd.text;
-        if (!isLast || ctx.endsWithNL) out += '\n';
+        if (nd.trailNL) out += '\n';
         break;
       }
       case 'quote': out += '<blockquote>\n' + renderBlocks(nd.children, { refs: ctx.refs, lazy: new Set(), endsWithNL: false }) + '</blockquote>\n'; break;
