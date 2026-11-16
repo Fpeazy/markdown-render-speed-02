@@ -736,6 +736,13 @@ function parseBlocks(src) {
   doc.children = [];
   const stack = [doc]; // open containers (doc, quote, list, item)
   let leaf = null; // open leaf block (para/code/html/table) or null
+  // True when the last paragraph line added was an indented (4+ cols
+  // beyond the item content) continuation inside a list item. The next
+  // line then cannot lazily continue the paragraph (doc-08/probe26:
+  // '* a' + '      b' + 'c' ends the list; 'c' is a top-level paragraph).
+  // Cleared whenever a non-indented paragraph line is added or a new
+  // paragraph starts.
+  let lastParaIndented = false;
   let pendingBlank = false;
   let pendingBlankDepth = 0; // container depth at which the blank occurred
 
@@ -1068,7 +1075,7 @@ function parseBlocks(src) {
         while (j < cur.s.length && cur.s.charCodeAt(j) === 96) { n++; j++; }
         if (n >= 3 && cur.s.slice(j).indexOf('`') >= 0) badBacktickFence = true;
       }
-      if (leaf && leaf.t === T_PARA && !isBlankAt(cur) && !startsInterrupt(cur) && !listMarkerHere && !badBacktickFence) {
+      if (leaf && leaf.t === T_PARA && !isBlankAt(cur) && !startsInterrupt(cur) && !listMarkerHere && !badBacktickFence && !lastParaIndented) {
         lazyLine = true;
         const fb = stack[k];
         lazyIndent = fb.t === T_ITEM ? fb.indent : 4;
@@ -1186,7 +1193,11 @@ function parseBlocks(src) {
           leaf.lines.push(text);
         }
       } else {
-        leaf.lines.push(text);
+        // A leading tab in a lazy continuation is expanded by absolute
+        // column (doc-08: '  \tindented' inside a blockquote in a list
+        // item gives '  indented', not a literal tab).
+        leaf.lines.push(expandLeadTabs(text, cur.c));
+        lastParaIndented = false;
       }
       continue;
     }
@@ -1207,16 +1218,25 @@ function parseBlocks(src) {
         }
       }
       cur.i = save.i; cur.c = save.c; cur.p = save.p;
-      // content line: strip up to fenceInd columns. A tab straddling the
-      // strip boundary is consumed ENTIRELY (marked: a tab at col 0 in a
+      // content line: strip up to fenceInd columns of leading whitespace.
+      // TILDE fence: marked strips NOTHING from content lines — spaces
+      // and tabs are all kept literal (probe25: ' ~~~' + ' X' keeps
+      // ' X'; probe22/23: tab runs are kept too).
+      // BACKTICK fence: strip up to fenceInd columns; a tab straddling
+      // the strip boundary is consumed ENTIRELY (a tab at col 0 in a
       // fence indented 1-3 leaves 0 spaces, not a partial-tab remainder;
-      // doc-13/17). So after adv, if a partial tab remains, eat the tab.
-      const avail = wsCols(cur);
-      const strip = Math.min(avail, leaf.fenceInd);
-      adv(cur, strip);
-      if (cur.p > 0) { cur.c += cur.p; cur.p = 0; cur.i++; }
+      // doc-13/17, doc-38). So after adv, if a partial tab remains, eat
+      // the tab.
+      if (leaf.fence.charCodeAt(0) !== 126) {
+        const avail = wsCols(cur);
+        const strip = Math.min(avail, leaf.fenceInd);
+        adv(cur, strip);
+        if (cur.p > 0) { cur.c += cur.p; cur.p = 0; cur.i++; }
+      }
       const codeText = rest(cur);
-      leaf.lines.push(k > 1 ? expandTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
+      // Only leading tabs are expanded (a tab after other content, e.g.
+      // '> \tindented' inside a fence, stays literal — doc-08).
+      leaf.lines.push(k > 1 ? expandLeadTabs(codeText, cur.c - (bqTotal - bqLast)) : codeText);
       continue;
     }
     if (leaf && leaf.t === T_CODE) {
@@ -1290,10 +1310,15 @@ function parseBlocks(src) {
             let n = 0;
             while (n < 4 && n < text.length && text.charCodeAt(n) === 32) n++;
             leaf.lines.push(text.slice(n));
+            // An indented paragraph line inside a list item blocks the
+            // next line's lazy continuation (doc-08/probe26).
+            lastParaIndented = true;
           } else if (top().t === T_QUOTE) {
             leaf.lines.push(expandLeadTabs(rest(cur), cur.c));
+            lastParaIndented = false;
           } else {
             leaf.lines.push(rest(cur));
+            lastParaIndented = false;
           }
           lineDone = true;
           break;
@@ -1517,10 +1542,17 @@ function parseBlocks(src) {
       // 9. paragraph
       if (leaf && leaf.t === T_PARA) {
         // continuation line: the leading spaces are part of the paragraph
-        // text (cm-222: " bbb" keeps its space). A leading tab inside a
-        // container is expanded by absolute column ('- a' + '  \tb' ->
-        // '  b'); tabs after content stay literal.
-        leaf.lines.push(expandLeadTabs(rest(cur), cur.c));
+        // text (cm-222: " bbb" keeps its space). A leading tab after a
+        // matched container marker is expanded by the effective column
+        // (doc-08: '  > \tindented' gives '  indented'); tabs after
+        // content stay literal.
+        // After an indented (4+) paragraph line in a list item, the next
+        // continuation is separated by a blank line in the output
+        // (doc-08/probe27: '* a' + '      b' + '\tindented' gives
+        // 'b\n\n  indented').
+        if (lastParaIndented) leaf.lines.push('');
+        leaf.lines.push(expandLeadTabs(rest(cur), cur.c - (contTotal - contLast)));
+        lastParaIndented = false;
         lineDone = true;
         break;
       }
@@ -1531,6 +1563,7 @@ function parseBlocks(src) {
         // '  indented'); at top level a leading tab would be indented
         // code, so this only matters inside a container.
         b.lines = [expandLeadTabs(rest(cur), cur.c - (contTotal - contLast))];
+        lastParaIndented = false;
         closeListIfTop();
         addChild(top(), b);
         leaf = b;
