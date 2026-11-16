@@ -666,6 +666,21 @@ function gatherParagraph(lines, i, ctx) {
   return { node: { t: 'p', text: pLines.join('\n') }, next: i };
 }
 
+// GFM task list: a list item whose first paragraph starts with '[ ] ',
+// '[x] ' or '[X] ' (followed by content) renders a checkbox. Returns
+// {checked, rest} where rest is the paragraph text after '[ ]' (keeps the
+// space after the bracket), or null.
+function taskMarker(text) {
+  const m = /^\[([ xX])\] /.exec(text);
+  if (!m) return null;
+  const rest = text.slice(3);
+  if (!/\S/.test(rest)) return null; // nothing after the marker -> not a task
+  return { checked: m[1] !== ' ', rest };
+}
+function taskInput(checked) {
+  return '<input' + (checked ? ' checked=""' : '') + ' disabled="" type="checkbox">';
+}
+
 // ---------- containers: blockquote & list ----------
 // Strip one blockquote marker (<=3 cols indent + '>' + one optional space/tab).
 // Returns the inner line or null.
@@ -840,16 +855,28 @@ function gatherList(lines, i, ctx) {
   const itemNodes = items.map(itemLines => {
     const sub = parseBlocks(itemLines.join('\n'), { refs: ctx.refs, lazy: new Set(), endsWithNL: false });
     if (sub.hadInterBlockBlank) loose = true;
-    return sub.nodes;
+    const nodes = sub.nodes;
+    // GFM task list: first paragraph starting with '[ ] '/'[x] '/'[X] '
+    if (nodes.length && nodes[0].t === 'p') {
+      const tm = taskMarker(nodes[0].text);
+      if (tm) nodes[0] = { t: 'p', text: tm.rest, task: tm.checked ? 'checked' : 'unchecked' };
+    }
+    return nodes;
   });
   return { node: { t: 'list', ordered, start: ordered ? first.start : 1, tight: !loose, items: itemNodes }, next: j };
 }
 
 // ---------- inline parsing ----------
 // Nodes: text, delim, code, html, br, link, img, em, strong, del, autolink.
+// CommonMark "Unicode punctuation" = general categories P (punctuation)
+// or S (symbol): currency signs like $ £ € count as punctuation for
+// flanking (cm-354: *$*alpha stays literal).
 function isPunctU(c) {
-  return c !== undefined && (PUNCT.indexOf(c) >= 0 || /\p{P}/u.test(c));
+  return c !== undefined && (PUNCT.indexOf(c) >= 0 || /[\p{P}\p{S}]/u.test(c));
 }
+// At a text boundary (undefined) there is no character: the reference
+// implementation treats the boundary as whitespace for flanking, so a
+// leading '_' can open (cm-357) and a trailing '*' can close (cm-056).
 function isSpaceU(c) { return c === undefined || /\s/.test(c); }
 
 function unescapeBackslash(s) {
@@ -925,6 +952,21 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
             }
           }
         }
+      } else {
+        // empty destination: [link]() or [link]( "title") (cm-485/487)
+        const t0 = skipWsNoBlank(text, r);
+        if (t0 >= 0 && text[t0] === ')') {
+          return { node: makeLinkNode(opener, nodes, openerIdx, '', null, refs), end: t0 + 1 };
+        }
+        if (t0 >= 0 && (text[t0] === '"' || text[t0] === "'" || text[t0] === '(')) {
+          const ti = parseTitle(text, t0);
+          if (ti) {
+            const u = skipWsNoBlank(text, ti.end);
+            if (u >= 0 && text[u] === ')') {
+              return { node: makeLinkNode(opener, nodes, openerIdx, '', ti.title, refs), end: u + 1 };
+            }
+          }
+        }
       }
     }
   }
@@ -978,7 +1020,8 @@ function scanInlineHtml(text, i) {
   if (m) return { html: m[0], end: i + m[0].length };
   m = /^<!\[CDATA\[(?:(?!\]\]>)[\s\S])*?\]\]>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
-  m = /^<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>/.exec(rest);
+  // open/close tag (attributes may be separated by newlines, cm-491)
+  m = /^<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
   return null;
 }
@@ -1194,9 +1237,11 @@ function processEmphasis(nodes) {
       for (let oi = ci - 1; oi >= 0; oi--) {
         const op = nodes[oi];
         if (op.t !== 'delim' || op.ch !== cl.ch || !op.canOpen) continue;
-        // odd-match rule: if both can open+close, the sum must not be a
-        // multiple of 3 unless both lengths are multiples of 3.
-        if (op.canOpen && op.canClose && cl.canOpen && cl.canClose) {
+        // odd-match rule (spec rule 9): if ONE of the delimiters can both
+        // open and close, the sum must not be a multiple of 3 unless both
+        // lengths are multiples of 3. (The old code required BOTH to be
+        // open+close, which let *foo**bar**baz* pair wrongly, cm-411.)
+        if ((op.canOpen && op.canClose) || (cl.canOpen && cl.canClose)) {
           if ((op.len + cl.len) % 3 === 0 && !(op.len % 3 === 0 && cl.len % 3 === 0)) continue;
         }
         // strikethrough: '~' runs must have equal length (1 with 1, 2 with 2)
@@ -1293,7 +1338,7 @@ function renderListItem(itemNodes, tight, ctx) {
   if (!tight) return renderBlocks(itemNodes, innerCtx);
   const parts = [];
   for (const nd of itemNodes) {
-    if (nd.t === 'p') parts.push(parseInline(nd.text, ctx.refs));
+    if (nd.t === 'p') parts.push((nd.task ? taskInput(nd.task === 'checked') : '') + parseInline(nd.text, ctx.refs));
     else parts.push(renderBlocks([nd], innerCtx));
   }
   return parts.join('');
@@ -1305,7 +1350,7 @@ function renderBlocks(nodes, ctx) {
     const nd = nodes[bi];
     const isLast = bi === nodes.length - 1;
     switch (nd.t) {
-      case 'p': out += '<p>' + parseInline(nd.text, ctx.refs) + '</p>\n'; break;
+      case 'p': out += '<p>' + (nd.task ? taskInput(nd.task === 'checked') : '') + parseInline(nd.text, ctx.refs) + '</p>\n'; break;
       case 'h': out += '<h' + nd.level + '>' + parseInline(nd.text, ctx.refs) + '</h' + nd.level + '>\n'; break;
       case 'hr': out += '<hr>\n'; break;
       case 'code': out += '<pre><code>' + escapeText(nd.text) + (nd.text ? '\n' : '') + '</code></pre>\n'; break;
