@@ -1262,12 +1262,16 @@ function processLine(P, c, leafReachable, wasBlank) {
         const al = tableDelim(c);
         if (al !== null) {
           const hd = splitTableRow(leaf.s.trim());
-          const table = mkTable(al, hd);
-          const par = leaf._parent;
-          par.ch[par.ch.indexOf(leaf)] = table;
-          P.leaf = table;
-          P.leafParent = par;
-          return;
+          // the delimiter row must have at least as many cells as the
+          // header, or this is not a table at all (just a paragraph)
+          if (al.length >= hd.length) {
+            const table = mkTable(al, hd);
+            const par = leaf._parent;
+            par.ch[par.ch.indexOf(leaf)] = table;
+            P.leaf = table;
+            P.leafParent = par;
+            return;
+          }
         }
       }
       if (startsInterruptingBlock(c, true)) {
@@ -2444,7 +2448,7 @@ function renderTable(t, refs) {
       }
       s += '</tr>\n';
     }
-    s += '</tbody>\n';
+    s += '</tbody>';
   }
   return s + '</table>\n';
 }
