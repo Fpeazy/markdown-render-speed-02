@@ -3583,8 +3583,11 @@ function renderBlock(b, refs, listCtx, index, count) {
     case T_HTML:
       // An HTML block is its lines joined by \n, with a trailing \n only
       // when the next source line is non-blank (or at EOF with a trailing
-      // newline) — recorded as trailNl when the block ended.
-      return b.lines.join('\n') + (b.trailNl ? '\n' : '');
+      // newline) — recorded as trailNl when the block ended. Round 4:
+      // a trailing \n is dropped when the HTML block is the last child
+      // of its list item (doc-30: '<!-- note -->' at a list-item start
+      // must not put '\n' before '</li>'), tight or loose.
+      return b.lines.join('\n') + (b.trailNl && !(listCtx && index === count - 1) ? '\n' : '');
     case T_QUOTE:
       // reset listCtx: a paragraph inside a blockquote is not a direct
       // child of a list item, so a tight list does not strip its <p>
