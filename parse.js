@@ -257,15 +257,17 @@ function parseTitle(src, i) {
 // title on a different line that fails -> def stands without title (end =
 // position right after the dest); title failing on the same line -> null.
 function parseRefDef(src, i) {
-  // label: balanced brackets, may span lines, no blank line, <= 999 chars
-  let j = i + 1, depth = 1, labelEnd = -1;
+  // label: ends at the first unescaped ']'; an unescaped '[' inside
+  // makes the label invalid (cm-547/548/590). A backslash escapes any
+  // ASCII punctuation (cm-550: 'bar\\' labels 'bar\').
+  let j = i + 1, labelEnd = -1;
   let blank = false;
-  while (j < src.length && depth > 0) {
+  while (j < src.length) {
     const c = src[j];
-    if (c === '\\' && j + 1 < src.length && (src[j + 1] === '[' || src[j + 1] === ']')) { j += 2; continue; }
-    if (c === '[') depth++;
-    else if (c === ']') { depth--; if (depth === 0) { labelEnd = j; break; } }
-    else if (c === '\n') {
+    if (c === '\\' && j + 1 < src.length && isPunct(src[j + 1])) { j += 2; continue; }
+    if (c === '[') return null;
+    if (c === ']') { labelEnd = j; break; }
+    if (c === '\n') {
       let k = j + 1;
       while (k < src.length && (src[k] === ' ' || src[k] === '\t')) k++;
       if (src[k] === '\n' || k >= src.length) { blank = true; break; }
@@ -354,8 +356,11 @@ function htmlBlockStart(line) {
   if (/^<!\[CDATA\[/.test(s)) return { type: 5 };
   const m = /^<\/?([A-Za-z][A-Za-z0-9-]*)(?:[ \t>\\\/]|$)/.exec(s);
   if (m && HTML_BLOCK_TAGS.has(m[1].toLowerCase())) return { type: 6 };
-  // type 7: any complete open/closing tag alone on the line
-  if (/^<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.test(s)) return { type: 7 };
+  // type 7: a complete OPEN tag (attributes allowed) or a BARE closing
+  // tag alone on the line. A closing tag with attributes is NOT a tag
+  // (cm-624: '</a href="foo">' is escaped literal text).
+  if (/^<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.test(s)) return { type: 7 };
+  if (/^<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>[ \t]*$/.test(s)) return { type: 7 };
   return null;
 }
 function htmlBlockEnds(type, line) {
@@ -917,20 +922,24 @@ function unescapeBackslash(s) {
 // Scan a label starting at src[i] === '['. Returns {label, end} or null.
 // Label may span lines (no blank line), brackets balanced, <= 999 chars.
 function scanLabel(src, i) {
-  let j = i + 1, depth = 1;
-  while (j < src.length && depth > 0) {
+  // A label ends at the first unescaped ']'; an unescaped '[' inside
+  // makes the label invalid (cm-547/548: labels cannot contain '[').
+  // A backslash escapes any ASCII punctuation (cm-550: 'bar\\' is a
+  // valid label for 'bar\').
+  let j = i + 1;
+  while (j < src.length) {
     const c = src[j];
-    if (c === '\\' && j + 1 < src.length && (src[j + 1] === '[' || src[j + 1] === ']')) { j += 2; continue; }
-    if (c === '[') depth++;
-    else if (c === ']') { depth--; if (depth === 0) break; }
-    else if (c === '\n') {
+    if (c === '\\' && j + 1 < src.length && isPunct(src[j + 1])) { j += 2; continue; }
+    if (c === '[') return null;
+    if (c === ']') break;
+    if (c === '\n') {
       let k = j + 1;
       while (k < src.length && (src[k] === ' ' || src[k] === '\t')) k++;
       if (src[k] === '\n' || k >= src.length) return null;
     }
     j++;
   }
-  if (depth !== 0) return null;
+  if (j >= src.length || src[j] !== ']') return null;
   const raw = src.slice(i + 1, j);
   if (raw.length > 999) return null;
   return { label: raw, end: j + 1 }; // empty label '' allowed: [foo][] is a collapsed reference
@@ -1004,19 +1013,22 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
   let emptyLabelEnd = -1;
   if (text[p] === '[') {
     const lab = scanLabel(text, p);
-    if (!lab) return null;
-    const key = normalizeLabel(lab.label);
-    if (key !== '') {
-      if (refs.has(key)) {
-        const ref = refs.get(key);
-        return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: lab.end };
+    // Malformed label (e.g. contains '['): fall through to the shortcut
+    // check — the '[foo]' may still be a shortcut link.
+    if (lab) {
+      const key = normalizeLabel(lab.label);
+      if (key !== '') {
+        if (refs.has(key)) {
+          const ref = refs.get(key);
+          return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: lab.end };
+        }
+        return null; // label present but undefined -> no link (no shortcut fallback)
       }
-      return null; // label present but undefined -> no link (no shortcut fallback)
+      // empty label '[]': collapsed reference, fall through to shortcut
+      // (link text is the label, e.g. [lexer callback][]); the '[]' is
+      // consumed too, so the end is the label's end, not just past ']'
+      emptyLabelEnd = lab.end;
     }
-    // empty label '[]': collapsed reference, fall through to shortcut
-    // (link text is the label, e.g. [lexer callback][]); the '[]' is
-    // consumed too, so the end is the label's end, not just past ']'
-    emptyLabelEnd = lab.end;
   }
   // shortcut reference: label = link text
   const rawLabel = text.slice(opener.pos + 1, linkTextEnd);
@@ -1042,12 +1054,12 @@ function makeLinkNode(opener, nodes, openerIdx, destRaw, titleRaw, refs) {
 function scanInlineHtml(text, i) {
   const rest = text.slice(i, i + 500);
   // abrupt-close comments (cm-626): '<!-->' and '<!--->' are complete
-  // comments; check before the general comment rule, and a comment's
-  // content must not contain '--'.
+  // comments; check before the general comment rule. A comment's
+  // content MAY contain '--' (cm-625) — it ends at the first '-->'.
   if (rest.startsWith('<!-->')) return { html: '<!-->', end: i + 5 };
   if (rest.startsWith('<!--->')) return { html: '<!--->', end: i + 6 };
   let m = /^<!--([\s\S]*?)-->/.exec(rest);
-  if (m && !m[1].includes('--')) return { html: m[0], end: i + m[0].length };
+  if (m) return { html: m[0], end: i + m[0].length };
   m = /^<\?(?:(?!\?>)[\s\S])*?\?>/.exec(rest);
   if (m) return { html: m[0], end: i + m[0].length };
   m = /^<![A-Za-z][\s\S]*?>/.exec(rest);
@@ -1078,10 +1090,16 @@ function scanAutolink(text, i) {
 // char before i (or undefined). Returns {href, text, end} or null.
 function scanGfmAutolink(text, i, prev) {
   const rest = text.slice(i);
-  // email (a '/' before it is fine)
+  // email (a '/' before it is fine). If the char right after the match
+  // is '-' or '_', the address is NOT an autolink at all (gfm-632:
+  // 'a.b-c_d@a.b-' and 'a.b-c_d@a.b_' stay literal text).
   const em = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+/.exec(rest);
   if (em && (prev === undefined || isSpaceU(prev) || isPunctU(prev))) {
-    return { href: 'mailto:' + em[0], text: em[0], end: i + em[0].length };
+    const after = rest[em[0].length];
+    if (after !== '-' && after !== '_') {
+      return { href: 'mailto:' + em[0], text: em[0], end: i + em[0].length };
+    }
+    return null;
   }
   // www. / scheme: must not be preceded by '/' (or an alphanumeric)
   const canStart = prev === undefined || isSpaceU(prev) || (isPunctU(prev) && prev !== '/');
@@ -1097,6 +1115,22 @@ function scanGfmAutolink(text, i, prev) {
   m = /^([A-Za-z][A-Za-z0-9+.-]{1,31}):\/\/[^\s<>]*/.exec(rest);
   if (m) {
     const url = trimGfmUrl(m[0]);
+    if (url) return { href: url, text: url, end: i + url.length };
+  }
+  // bare scheme + email: 'mailto:foo@bar.baz' links the whole thing
+  // (gfm-633); 'xmpp:foo@bar.baz/txt' also takes ONE path segment
+  // (gfm-634/635: '/bin' stays text). 'mailto:' takes no segment.
+  // A trailing '-' or '_' after the email voids the autolink.
+  m = /^(mailto|xmpp):([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)/i.exec(rest);
+  if (m) {
+    let url = m[0];
+    const after = rest[url.length];
+    if (after === '-' || after === '_') return null;
+    if (m[1].toLowerCase() === 'xmpp' && after === '/') {
+      const seg = /^\/[^\s<>\/]*/.exec(rest.slice(url.length));
+      if (seg) url += seg[0];
+    }
+    url = trimGfmUrl(url);
     if (url) return { href: url, text: url, end: i + url.length };
   }
   return null;
@@ -1442,16 +1476,20 @@ function renderBlocks(nodes, ctx) {
           const al = nd.aligns[ci];
           out += '<th' + (al ? ' align="' + al + '"' : '') + '>' + parseInline(nd.header[ci], ctx.refs) + '</th>\n';
         }
-        out += '</tr>\n</thead>\n<tbody>';
-        for (const row of nd.rows) {
-          out += '<tr>\n';
-          for (let ci = 0; ci < row.length; ci++) {
-            const al = nd.aligns[ci];
-            out += '<td' + (al ? ' align="' + al + '"' : '') + '>' + parseInline(row[ci], ctx.refs) + '</td>\n';
+        out += '</tr>\n</thead>\n';
+        if (nd.rows.length) {
+          out += '<tbody>';
+          for (const row of nd.rows) {
+            out += '<tr>\n';
+            for (let ci = 0; ci < row.length; ci++) {
+              const al = nd.aligns[ci];
+              out += '<td' + (al ? ' align="' + al + '"' : '') + '>' + parseInline(row[ci], ctx.refs) + '</td>\n';
+            }
+            out += '</tr>\n';
           }
-          out += '</tr>\n';
+          out += '</tbody>';
         }
-        out += '</tbody></table>\n';
+        out += '</table>\n';
         break;
       }
     }
