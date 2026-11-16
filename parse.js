@@ -959,6 +959,26 @@ function skipWsNoBlank(src, i) {
   return j;
 }
 
+// Finish forming a link/image. For a LINK, the link text must not
+// contain another link (the inner link wins and the outer stays literal
+// — CommonMark), and GFM autolinks inside link text stay plain text
+// (doc-01/04/06: a bare URL/email inside '[...](...)' is text, not a
+// nested <a>). Images may contain links (badge pattern '[![alt](src)](url)')
+// and their alt renders as text anyway, so they are exempt. The link
+// check runs before any stripping, so a rejected outer link leaves the
+// inner autolinks untouched.
+function finishLink(opener, nodes, openerIdx, destRaw, titleRaw, refs, end) {
+  if (opener.kind === 'link') {
+    for (let k = openerIdx + 1; k < nodes.length; k++) {
+      if (nodes[k].t === 'link') return null;
+    }
+    for (let k = openerIdx + 1; k < nodes.length; k++) {
+      if (nodes[k].t === 'autolink') nodes[k] = { t: 'text', s: nodes[k].text };
+    }
+  }
+  return { node: makeLinkNode(opener, nodes, openerIdx, destRaw, titleRaw, refs), end };
+}
+
 // Try to form a link/image at text[pos] === ']' (pos is index of ']').
 // nodes: current node list; openerIdx: index of the active opener node.
 // Returns {node, end} (end = index just past the link syntax) or null.
@@ -979,13 +999,13 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
         const t = skipWsNoBlank(text, s);
         if (t >= 0) {
           if (text[t] === ')') {
-            return { node: makeLinkNode(opener, nodes, openerIdx, d.dest, null, refs), end: t + 1 };
+            return finishLink(opener, nodes, openerIdx, d.dest, null, refs, t + 1);
           }
           const ti = parseTitle(text, t);
           if (ti) {
             const u = skipWsNoBlank(text, ti.end);
             if (u >= 0 && text[u] === ')') {
-              return { node: makeLinkNode(opener, nodes, openerIdx, d.dest, ti.title, refs), end: u + 1 };
+              return finishLink(opener, nodes, openerIdx, d.dest, ti.title, refs, u + 1);
             }
           }
         }
@@ -993,14 +1013,14 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
         // empty destination: [link]() or [link]( "title") (cm-485/487)
         const t0 = skipWsNoBlank(text, r);
         if (t0 >= 0 && text[t0] === ')') {
-          return { node: makeLinkNode(opener, nodes, openerIdx, '', null, refs), end: t0 + 1 };
+          return finishLink(opener, nodes, openerIdx, '', null, refs, t0 + 1);
         }
         if (t0 >= 0 && (text[t0] === '"' || text[t0] === "'" || text[t0] === '(')) {
           const ti = parseTitle(text, t0);
           if (ti) {
             const u = skipWsNoBlank(text, ti.end);
             if (u >= 0 && text[u] === ')') {
-              return { node: makeLinkNode(opener, nodes, openerIdx, '', ti.title, refs), end: u + 1 };
+              return finishLink(opener, nodes, openerIdx, '', ti.title, refs, u + 1);
             }
           }
         }
@@ -1020,7 +1040,7 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
       if (key !== '') {
         if (refs.has(key)) {
           const ref = refs.get(key);
-          return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: lab.end };
+          return finishLink(opener, nodes, openerIdx, ref.dest, ref.title, refs, lab.end);
         }
         return null; // label present but undefined -> no link (no shortcut fallback)
       }
@@ -1035,7 +1055,7 @@ function tryLink(text, pos, nodes, openerIdx, refs) {
   const key = normalizeLabel(rawLabel);
   if (refs.has(key)) {
     const ref = refs.get(key);
-    return { node: makeLinkNode(opener, nodes, openerIdx, ref.dest, ref.title, refs), end: emptyLabelEnd >= 0 ? emptyLabelEnd : pos + 1 };
+    return finishLink(opener, nodes, openerIdx, ref.dest, ref.title, refs, emptyLabelEnd >= 0 ? emptyLabelEnd : pos + 1);
   }
   return null;
 }
@@ -1088,7 +1108,10 @@ function scanAutolink(text, i) {
 
 // GFM autolink (www. / scheme / email) starting at text[i]. prev is the
 // char before i (or undefined). Returns {href, text, end} or null.
-function scanGfmAutolink(text, i, prev) {
+// inLink: inside a link's text — www/scheme autolinks do NOT form there
+// (doc-01/06/12: the bare URL stays plain text inside '[...](...)'),
+// but EMAIL autolinks DO nest inside link text (doc-04/09/21).
+function scanGfmAutolink(text, i, prev, inLink) {
   const rest = text.slice(i);
   // email (a '/' before it is fine). If the char right after the match
   // is '-' or '_', the address is NOT an autolink at all (gfm-632:
@@ -1101,6 +1124,7 @@ function scanGfmAutolink(text, i, prev) {
     }
     return null;
   }
+  if (inLink) return null; // no www/scheme autolink inside link text
   // www. / scheme: must not be preceded by '/' (or an alphanumeric)
   const canStart = prev === undefined || isSpaceU(prev) || (isPunctU(prev) && prev !== '/');
   if (!canStart) return null;
@@ -1160,6 +1184,19 @@ function trimGfmUrl(url) {
   }
   // a www. URL needs a dot in the domain part
   return u;
+}
+
+// Is there an ACTIVE link/image opener on the node stack? (For GFM
+// autolink suppression inside link text.) Scans backwards from the end;
+// an inactive opener does not stop the scan (an earlier active opener,
+// e.g. cm-520's image opener, may sit behind it). Capped — a link text
+// spanning thousands of nodes does not occur in practice.
+function hasActiveOpener(nodes) {
+  let scanned = 0;
+  for (let k = nodes.length - 1; k >= 0 && scanned < 2000; k--, scanned++) {
+    if (nodes[k].t === 'open' && nodes[k].active) return true;
+  }
+  return false;
 }
 
 function tokenizeInline(text, refs) {
@@ -1298,7 +1335,7 @@ function tokenizeInline(text, refs) {
       const prev = i > 0 ? text[i - 1] : undefined;
       // only attempt when at a word start-ish position
       if (prev === undefined || isSpaceU(prev) || isPunctU(prev)) {
-        const g = scanGfmAutolink(text, i, prev);
+        const g = scanGfmAutolink(text, i, prev, hasActiveOpener(nodes));
         if (g) { flush(); nodes.push({ t: 'autolink', href: g.href, text: g.text }); i = g.end; continue; }
       }
     }
