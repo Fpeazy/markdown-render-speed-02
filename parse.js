@@ -2500,7 +2500,10 @@ function scanInline(s, refs) {
   // literal). Set in tryLink when such a link forms; cleared on '['
   // (emphasis inside a link's own text is not suppressed, doc-35).
   let suppressEmphUntilTick = false;
-  const lastTick = s.lastIndexOf('`');
+  // Round 4: position of the last backtick in this paragraph, computed
+  // lazily (only when the post-link suppression flag is set) so the
+  // common no-unmatched-link path pays no scan.
+  let lastTick = -2;
   // Round 4: bracket depth — emphasis inside a link's own text is not
   // suppressed by an outer unmatched-backtick link (doc-35: '*fast*'
   // inside '[default run*fast*](...)' forms). Track '[' / ']' so the
@@ -2823,7 +2826,10 @@ function scanInline(s, refs) {
       // backtick after it, the emphasis forms normally. Only at
       // bracket depth 0 (emphasis inside a link's own text is the
       // link's content, not suppressed).
-      if (suppressEmphUntilTick && bracketDepth === 0 && j <= lastTick) { buf += s.slice(i, j); i = j; continue; }
+      if (suppressEmphUntilTick && bracketDepth === 0) {
+        if (lastTick === -2) lastTick = s.lastIndexOf('`');
+        if (j <= lastTick) { buf += s.slice(i, j); i = j; continue; }
+      }
       // GFM: a ~~~ run (3+) is not a strikethrough delimiter at all
       if (c === 126 && len >= 3) { buf += s.slice(i, j); i = j; continue; }
       const fl = flanking(s, i, len);
