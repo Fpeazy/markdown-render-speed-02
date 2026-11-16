@@ -1658,8 +1658,13 @@ function mkNode(t, s, h, ti) {
 function mkDelim(c, n, o, l, node, ix, im) {
   // after: char code right after this delimiter run (-1 at end of string);
   // set by scanInline after creation. sc: true once this delimiter was
-  // used as a strong (**) closer.
-  return { c: c, n: n, o: o, l: l, a: true, nd: node, ix: ix, im: im, after: -1, sc: false };
+  // used as a strong (**) closer. op/ul: when this delimiter is used as
+  // a closer, op is the opener delimiter it matched and ul is how many
+  // delimiter chars were used (1 for em, 2 for strong) — used by the
+  // marked emphasis quirk (inner emphasis blocking an outer one). bl:
+  // true once this closer has blocked an outer emphasis (it blocks only
+  // the first closer after it).
+  return { c: c, n: n, o: o, l: l, a: true, nd: node, ix: ix, im: im, after: -1, sc: false, op: null, ul: 0, bl: false };
 }
 
 // native-scanner fast path (technique 2): a single regex test replaces
@@ -2634,6 +2639,38 @@ function processEmphasis(delims) {
         }
       }
       const use = (o.n >= 2 && d.n >= 2) ? 2 : 1;
+      // marked emphasis quirk (not in the spec algorithm): an inner
+      // emphasis whose closer is immediately followed by a word character,
+      // and whose opener can only open (it is preceded by a space, not a
+      // word char), blocks an outer emphasis of a DIFFERENT length.
+      // '**a *b*c d**' stays literal ('**a <em>b</em>c d**'), while
+      // '**a*b*c d**' forms ('<strong>a<em>b</em>c d</strong>'), and
+      // '**a *b* c**' (space after the inner closer) forms too. The
+      // inner emphasis is already formed when the outer closer is
+      // processed, so its closer carries op (the opener it matched) and
+      // ul (how many delimiters it used). Two limits: the block only
+      // fires when the closer run is exactly consumed (d.n === use — a
+      // longer run splits, the extra delimiter going literal inside, so
+      // '**a *b*c***' still forms '<strong>a <em>b</em>c*</strong>'),
+      // and each inner closer blocks only the FIRST closer after it
+      // (a later '**' can still pair with the outer opener, so
+      // '**a *b*c** d**' forms '<strong>a <em>b</em>c** d</strong>').
+      if (d.c !== 126 && d.n === use) {
+        let blocked = false;
+        for (let xi = oi + 1; xi < di; xi++) {
+          const x = delims[xi];
+          // only an inner emphasis of the SAME delimiter char blocks
+          // (an inner ** must not block an outer _ : doc-05/21/31)
+          if (x.c !== d.c) continue;
+          if (!x.op || x.bl || x.ul === use) continue;
+          if (!(x.op.o && !x.op.l)) continue;
+          if (!isAlnum(x.after)) continue;
+          x.bl = true;
+          blocked = true;
+          break;
+        }
+        if (blocked) { oi--; continue; }
+      }
       const t = d.c === 126 ? N_DEL : (use === 2 ? N_STRONG : N_EM);
       // wrap the nodes between the opener and the closer
       const emNode = mkNode(t, '', '', '');
@@ -2657,6 +2694,11 @@ function processEmphasis(delims) {
       d.nd.s = d.nd.s.slice(use);
       o.n -= use;
       d.n -= use;
+      // record the match on the closer for the marked emphasis quirk
+      // (see the blocking check above): the next outer closer can tell
+      // this closer matched `o` with `use` delimiters.
+      d.op = o;
+      d.ul = use;
       if (o.n === 0) o.a = false;
       if (d.n === 0) { d.a = false; break; }
       // closer still has length: re-check the same opener (it may too)
